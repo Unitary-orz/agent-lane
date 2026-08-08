@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source_dir="$project_root/integrations/hermes/skills/agent-lane-codex"
+target_dir="${HERMES_SKILLS_DIR:-$HOME/.hermes/skills}/autonomous-ai-agents/agent-lane-codex"
+
+if [[ ! -d "$source_dir" ]]; then
+  echo "source skill not found: $source_dir" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$target_dir")"
+
+if [[ -L "$target_dir" ]]; then
+  current="$(readlink "$target_dir")"
+  if [[ "$current" == "$source_dir" ]]; then
+    echo "$target_dir"
+    exit 0
+  fi
+  echo "target symlink points elsewhere: $target_dir -> $current" >&2
+  exit 1
+fi
+
+if [[ -e "$target_dir" ]]; then
+  echo "target already exists and is not a symlink: $target_dir" >&2
+  exit 1
+fi
+
+ln -s "$source_dir" "$target_dir"
+echo "$target_dir"

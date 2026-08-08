@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-lane"
+version = "1.0.0-rc.1"
+description = "JSON-first control layer for durable Codex tasks"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Unitary-orz" }]
+dependencies = []
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "packaging>=24",
+  "pytest>=8",
+  "ruff>=0.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/Unitary-orz/agent-lane"
+Repository = "https://github.com/Unitary-orz/agent-lane"
+Issues = "https://github.com/Unitary-orz/agent-lane/issues"
+Changelog = "https://github.com/Unitary-orz/agent-lane/blob/main/CHANGELOG.md"
+
+[project.scripts]
+agent-lane = "agent_lane.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

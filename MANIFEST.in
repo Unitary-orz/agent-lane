@@ -1,0 +1,10 @@
+include CHANGELOG.md
+include CONTRIBUTING.md
+include LICENSE
+include README.md
+include README.zh-CN.md
+include SECURITY.md
+recursive-include docs *.md
+prune docs/design-options
+recursive-include integrations *.md
+include integrations/hermes/install-skill
