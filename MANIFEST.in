@@ -4,6 +4,7 @@ include LICENSE
 include README.md
 include README.zh-CN.md
 include SECURITY.md
+include scripts/release_notes.py
 include tests/conftest.py
 recursive-include docs *.md
 prune docs/design-options

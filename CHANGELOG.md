@@ -1,14 +1,18 @@
-# Changelog
+# 📦 Changelog
 
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [Unreleased] 🚧
 
-## 1.0.0-rc.2 - 2026-08-09
+> No unreleased changes yet.
 
-### Added
+## [v1.0.0-rc.2] - 2026-08-09 🚀
+
+> Safer control contracts, clearer defaults, and smoother Codex task handoff.
+
+### ✨ Added
 
 - Added a root `agent-lane --version` command for installation verification.
 - Added a user-level default Effort configuration with `xh` normalization,
@@ -16,7 +20,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added canonical execution evidence and conflict reporting across execution,
   closeout, and session views.
 
-### Changed
+### 🔄 Changed
 
 - Made beta managed commit-signing injection opt-in. New lanes and lanes
   without stored signing metadata now default to `--commit-signing off`;
@@ -39,9 +43,16 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   secret-key detection to credential-shaped names, and allowed trusted daemon
   CLI fallback after candidate-specific probe failures.
 
-## 1.0.0-rc.1 - 2026-08-08
+### 🚀 Engineering
 
-### Added
+- Added strict Changelog-driven GitHub Release publication with version,
+  test, build, package-install, and duplicate-release checks.
+
+## [v1.0.0-rc.1] - 2026-08-08 🌱
+
+> The first public V1 release candidate and its core execution model.
+
+### ✨ Added
 
 - Explicit `independent` and `app-sync` execution modes.
 - App Sync login configuration with protocol-level readiness checks.
@@ -49,7 +60,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Unified schema-versioned JSON envelopes and JSONL watch output.
 - Bilingual product documentation, open-source governance files, and macOS CI.
 
-### Changed
+### 🔄 Changed
 
 - Reorganized the CLI into execution, session-view, and self-configuration
   layers.
@@ -58,7 +69,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Moved provider-specific workflow assets under `integrations/`.
 - Raised the formally supported Python version to 3.11 or newer.
 
-### Removed
+### 🗑️ Removed
 
 - App page navigation, `--app-refresh`, and `--no-app-refresh`.
 - Pre-1.0 command aliases and output-only options such as `--brief`.
