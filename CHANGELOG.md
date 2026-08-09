@@ -6,9 +6,15 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 1.0.0-rc.2 - 2026-08-09
+
 ### Added
 
 - Added a root `agent-lane --version` command for installation verification.
+- Added a user-level default Effort configuration with `xh` normalization,
+  explicit-command precedence, and effective value/source reporting.
+- Added canonical execution evidence and conflict reporting across execution,
+  closeout, and session views.
 
 ### Changed
 
@@ -17,6 +23,21 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing lanes continue using their persisted mode.
 - Clarified the separate CLI and assistant-Skill installation paths, including
   first-run readiness checks and the source-symlink packaging boundary.
+- Made first App-task takeover more direct with control projections, an
+  `independent` attach default, lane-free attach, and exact thread-based
+  follow-up targets while keeping attach explicit.
+- Added unified fail-closed task targeting by thread, exact attached title,
+  current working-directory context, or compatible lane ID across execution,
+  session, and Goal commands. New `run` and `goal set` operations generate the
+  internal lane identity when omitted.
+- Kept exact thread-ID reads available when an unrelated lane record is
+  unreadable, while control and contextual selection remain fail-closed.
+- Made attach and recovery commands self-contained, including observed
+  execution mode, complete follow-up arguments, and explicit same-lane mode
+  rebinding.
+- Made Effort `set` and `clear` repair parseable invalid Effort fields, narrowed
+  secret-key detection to credential-shaped names, and allowed trusted daemon
+  CLI fallback after candidate-specific probe failures.
 
 ## 1.0.0-rc.1 - 2026-08-08
 

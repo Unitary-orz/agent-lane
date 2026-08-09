@@ -12,9 +12,10 @@ from agent_lane.workspace import WorkspaceError
 class FakeAdoptCodex:
     cwd = None
     resumed_cwd = None
+    transports = []
 
     def __init__(self, *_args, **_kwargs):
-        pass
+        type(self).transports.append(_kwargs.get("transport"))
 
     def __enter__(self):
         return self
@@ -113,6 +114,119 @@ def test_adopt_binds_existing_app_thread_to_lane(tmp_path, monkeypatch, capsys):
     assert alias["codex_title"] == "App task"
     assert result["title"] == "App task"
     assert result["title_source"] == "codex_title"
+    assert result["control"] == {
+        "binding_status": "attached",
+        "control_ready": True,
+        "requires_explicit_attach": False,
+        "lane_id": "app-task",
+        "thread_id": "thread-app",
+        "suggested_lane_id": None,
+        "target_argv": [
+            "--thread-id",
+            "thread-app",
+            "--alias-root",
+            str(tmp_path / "aliases"),
+        ],
+        "lane_target_argv": [
+            "--lane-id",
+            "app-task",
+            "--alias-root",
+            str(tmp_path / "aliases"),
+        ],
+        "attach_argv": None,
+        "send_target_argv": [
+            "codex",
+            "send",
+            "--thread-id",
+            "thread-app",
+            "--alias-root",
+            str(tmp_path / "aliases"),
+        ],
+    }
+
+
+def test_attach_defaults_to_independent_without_implicit_send(
+    tmp_path, monkeypatch, capsys
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    FakeAdoptCodex.cwd = workspace
+    monkeypatch.setattr(cli, "CodexAppServer", FakeAdoptCodex)
+
+    rc = main(
+        [
+            "codex",
+            "session",
+            "attach",
+            "--lane-id",
+            "app-task",
+            "--thread-id",
+            "thread-app",
+            "--alias-root",
+            str(tmp_path / "aliases"),
+        ]
+    )
+    result = decode_cli_output(capsys.readouterr().out)
+
+    assert rc == 0, result
+    assert result["adopted"] is True
+    assert result["execution_mode"] == "independent"
+    assert result["execution_mode_source"] == "default"
+    assert result["control"]["binding_status"] == "attached"
+    assert result["control"]["send_target_argv"] == [
+        "codex",
+        "send",
+        "--thread-id",
+        "thread-app",
+        "--alias-root",
+        str(tmp_path / "aliases"),
+    ]
+
+
+def test_attach_can_explicitly_rebind_existing_lane_to_app_sync(
+    tmp_path, monkeypatch, capsys
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    aliases = tmp_path / "aliases"
+    save_alias(
+        "codex",
+        "app-task",
+        {
+            "codex_thread_id": "thread-app",
+            "cwd": str(workspace),
+            "execution_mode": "independent",
+            "execution_mode_source": "default",
+        },
+        aliases,
+    )
+    FakeAdoptCodex.cwd = workspace
+    FakeAdoptCodex.transports = []
+    monkeypatch.setattr(cli, "CodexAppServer", FakeAdoptCodex)
+
+    rc = main(
+        [
+            "codex",
+            "session",
+            "attach",
+            "--thread-id",
+            "thread-app",
+            "--mode",
+            "app-sync",
+            "--alias-root",
+            str(aliases),
+        ]
+    )
+    result = decode_cli_output(capsys.readouterr().out)
+    alias = load_alias("codex", "app-task", aliases)
+
+    assert rc == 0, result
+    assert result["lane_id"] == "app-task"
+    assert result["execution_mode"] == "app-sync"
+    assert result["execution_mode_source"] == "explicit"
+    assert alias["execution_mode"] == "app-sync"
+    assert alias["binding"]["execution_mode"] == "app-sync"
+    assert FakeAdoptCodex.transports == ["daemon"]
 
 
 def test_adopt_rejects_thread_bound_to_another_lane(tmp_path, monkeypatch, capsys):
@@ -238,17 +352,21 @@ def test_send_refreshes_adopted_thread_cwd_before_resume(tmp_path, monkeypatch, 
     assert result["requested_model"] == "gpt-alias"
     assert result["requested_model_source"] == "alias"
     assert result["requested_effort"] is None
-    assert result["requested_effort_source"] == "default-or-unset"
+    assert result["requested_effort_source"] == "unset"
+    assert result["effective_effort"] is None
+    assert result["effective_effort_source"] == "unset"
     assert FakeAdoptCodex.resumed_cwd == str(new_workspace)
     assert alias["cwd"] == str(new_workspace)
     assert alias["workspace"]["kind"] == "local"
     assert alias["requested_model"] == "gpt-alias"
     assert alias["requested_model_source"] == "alias"
     assert alias["requested_effort"] is None
-    assert alias["requested_effort_source"] == "default-or-unset"
+    assert alias["requested_effort_source"] == "unset"
+    assert alias["effective_effort"] is None
+    assert alias["effective_effort_source"] == "unset"
 
 
-@pytest.mark.parametrize("option", ["--thread-id", "--adopt-as"])
+@pytest.mark.parametrize("option", ["--adopt-as"])
 def test_send_rejects_removed_direct_attach_options(option, capsys):
     rc = main(["codex", "send", option, "thread-app", "--prompt", "continue"])
     result = decode_cli_output(capsys.readouterr().out)
@@ -257,6 +375,8 @@ def test_send_rejects_removed_direct_attach_options(option, capsys):
     assert result["error_code"] == "CLI_REMOVED"
     assert result["removed"] == option
     assert result["replacement"] == "codex session attach"
+    assert result["control_requires_explicit_attach"] is True
+    assert result["thread_id"] == "thread-app"
 
 
 def test_adopt_registry_lock_serializes_thread_binding(tmp_path):

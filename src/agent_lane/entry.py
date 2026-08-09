@@ -28,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     except CliUsageError as exc:
         _print(usage_failure(_command_from_argv(raw_args), str(exc)))
         return 2
+    args._raw_argv = raw_args
 
     command = str(getattr(args, "command_name", _command_from_argv(raw_args)))
     handler = command_handlers().get(str(args.handler))
@@ -49,9 +50,15 @@ def main(argv: list[str] | None = None) -> int:
         with _command_locks(args):
             result = handler(args)
     except WorkspaceError as exc:
+        target_resolution = getattr(args, "_target_resolution", None)
+        if isinstance(target_resolution, dict):
+            exc.details.setdefault("target_resolution", target_resolution)
         _print(failure_envelope(command, exc.as_dict()))
         return 1
     except CodexRpcError as exc:
+        target_resolution = getattr(args, "_target_resolution", None)
+        if isinstance(target_resolution, dict):
+            exc.details.setdefault("target_resolution", target_resolution)
         _print(failure_envelope(command, exc.as_dict()))
         return 1
     except Exception as exc:
@@ -69,6 +76,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    target_resolution = getattr(args, "_target_resolution", None)
+    if isinstance(result, dict) and isinstance(target_resolution, dict):
+        result["target_resolution"] = _final_target_resolution(
+            target_resolution,
+            result,
+        )
     envelope = (
         failure_envelope(command, result)
         if isinstance(result, dict) and not result.get("ok", True)
@@ -138,7 +151,7 @@ def _command_from_argv(argv: list[str]) -> str:
 
 def _removed_cli_request(argv: list[str]) -> dict[str, object] | None:
     if tuple(argv[:2]) in {("codex", "send"), ("codex", "steer")}:
-        for option in ("--thread-id", "--adopt-as"):
+        for option in ("--adopt-as",):
             if option in argv:
                 return usage_failure(
                     ".".join(argv[:2]),
@@ -149,6 +162,8 @@ def _removed_cli_request(argv: list[str]) -> dict[str, object] | None:
                     code="CLI_REMOVED",
                     removed=option,
                     replacement="codex session attach",
+                    control_requires_explicit_attach=True,
+                    thread_id=_option_value(argv, option),
                 )
 
     command_map: dict[tuple[str, ...], str | None] = {
@@ -204,3 +219,28 @@ def _removed_cli_request(argv: list[str]) -> dict[str, object] | None:
                 replacement=replacement,
             )
     return None
+
+
+def _option_value(argv: list[str], option: str) -> str | None:
+    try:
+        index = argv.index(option)
+    except ValueError:
+        return None
+    value_index = index + 1
+    if value_index >= len(argv) or argv[value_index].startswith("-"):
+        return None
+    return argv[value_index]
+
+
+def _final_target_resolution(
+    resolution: dict[str, object],
+    result: dict[str, object],
+) -> dict[str, object]:
+    final = dict(resolution)
+    resolved = dict(final.get("resolved") or {})
+    if "lane_id" in result:
+        resolved["lane_id"] = result.get("lane_id")
+    if "codex_thread_id" in result:
+        resolved["thread_id"] = result.get("codex_thread_id")
+    final["resolved"] = resolved
+    return final

@@ -21,6 +21,17 @@ Managed commit-signing injection is a beta feature and defaults to `off`. Do not
 initialize it as routine lane setup. When managed signing is explicitly required,
 obtain authority to initialize and test it, then pass `--commit-signing agent`.
 
+When the user requested or authorized a persistent effort default, configure it
+in agent-lane and verify the result:
+
+```bash
+agent-lane config effort set xh
+agent-lane config effort status
+```
+
+Explicit `--effort` always wins. Read `effective_effort_source`; do not reuse a
+previous alias value as an implicit default or edit Codex configuration.
+
 ## 2. Select the mode
 
 Choose `independent` unless App collaboration is specifically useful. App Sync
@@ -54,15 +65,16 @@ the appropriate user authorization.
 
 ```bash
 agent-lane codex run \
-  --lane-id "project-bounded-change" \
+  --title "project-bounded-change" \
   --mode independent \
   --cwd "/path/to/project" \
   --worktree \
   --prompt-file "/path/to/bounded-task.md"
 ```
 
-The response is one JSON envelope. Persist the `lane_id` and use it for every
-follow-up. Do not treat an observation timeout as cancellation.
+The response is one JSON envelope. Retain its exact thread target and internal
+`lane_id` as machine state; the human does not need to create or remember the
+lane ID. Do not treat an observation timeout as cancellation.
 
 ## 4. Observe proportionally
 
@@ -70,7 +82,7 @@ For a short task:
 
 ```bash
 agent-lane codex wait \
-  --lane-id "project-bounded-change" \
+  --thread-id "<selected-thread-id>" \
   --timeout 600
 ```
 
@@ -78,12 +90,16 @@ For a longer task, use bounded checkpoints and report only meaningful changes:
 
 ```bash
 agent-lane codex checkpoint \
-  --lane-id "project-bounded-change" \
+  --thread-id "<selected-thread-id>" \
   --after 300
 ```
 
 Use `status` for an immediate snapshot. Use `watch` only when the parent can
 consume JSONL and has a reason to monitor continuously.
+
+Branch on `execution.state` and its evidence. Positive active-thread or live
+runner evidence wins over Goal and cached terminal fields. If the state is
+`unknown`, observe again instead of issuing another `send`.
 
 ## 5. Continue or correct
 
@@ -91,20 +107,27 @@ If the completed turn needs a follow-up:
 
 ```bash
 agent-lane codex send \
-  --lane-id "project-bounded-change" \
+  --thread-id "<selected-thread-id>" \
   --prompt "Run the focused regression test and fix only the reported failure."
 ```
 
 If an App Sync turn is still running and needs new context, use `steer`. Do not
 use `send` to race an active turn.
 
+For a Codex App task with no lane, use `session list` or read it by thread ID
+first. The returned `control.attach_argv` is only a suggestion; run an explicit
+lane-free `session attach`, inspect the attached result, then use its thread ID
+in a separate `send`. Read-only discovery never creates control ownership.
+When discovery or a contextual selector returns `CODEX_TARGET_AMBIGUOUS`, choose
+one returned `choices[].target_argv`; never infer the most recent candidate.
+
 ## 6. Independently inspect the result
 
 ```bash
-agent-lane codex closeout --lane-id "project-bounded-change"
-agent-lane codex session outline --lane-id "project-bounded-change"
+agent-lane codex closeout --thread-id "<selected-thread-id>"
+agent-lane codex session outline --thread-id "<selected-thread-id>"
 agent-lane codex session read \
-  --lane-id "project-bounded-change" \
+  --thread-id "<selected-thread-id>" \
   --include-turns
 ```
 
@@ -115,7 +138,7 @@ that reported tests are relevant, and that no unrelated changes were included.
 
 Give the user:
 
-- the lane ID;
+- the task title and exact thread target;
 - outcome and changed artifacts;
 - exact validation performed;
 - remaining risks or blockers;
@@ -125,7 +148,7 @@ Only after confirming the task is inactive and the managed worktree is safe:
 
 ```bash
 agent-lane codex cleanup \
-  --lane-id "project-bounded-change" \
+  --thread-id "<selected-thread-id>" \
   --confirm-thread-inactive
 ```
 

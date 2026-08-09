@@ -1306,6 +1306,9 @@ def test_status_summary_is_compact_machine_readable_json(
     result = decode_cli_output(capsys.readouterr().out)
 
     assert rc == 0
+    target_resolution = result.pop("target_resolution")
+    execution = result.pop("execution")
+    last_turn = result.pop("last_turn")
     assert result == {
         "ok": True,
         "lane_id": "lane-1",
@@ -1326,6 +1329,8 @@ def test_status_summary_is_compact_machine_readable_json(
         "requested_model_source": "unknown",
         "requested_effort": None,
         "requested_effort_source": "unknown",
+        "effective_effort": None,
+        "effective_effort_source": "unknown",
         "runner_status": "timed_out",
         "local_runner_status": "timed_out",
         "runner_alive": False,
@@ -1343,6 +1348,14 @@ def test_status_summary_is_compact_machine_readable_json(
         "workspace_kind": "local",
         "app_native_handoff": None,
     }
+    assert execution["state"] == "inactive"
+    assert execution["active"] is False
+    assert execution["effective_turn_status"] == "timed_out"
+    assert execution["evidence"]["goal"]["status"] == "active"
+    assert execution["conflicts"] == []
+    assert last_turn["status"] == "timed_out"
+    assert target_resolution["source"] == "explicit_lane_id"
+    assert last_turn["source"] == "alias"
     assert "alias" not in result
     assert "thread" not in result
     assert "goal" not in result
@@ -1787,7 +1800,9 @@ def test_runner_state_keeps_daemon_timeout_uncertain(monkeypatch):
     runner = cli._runner_state(alias)
 
     assert runner["status"] == "unknown"
-    assert runner["needs_resume"] is True
+    assert runner["execution_active"] is None
+    assert runner["execution"]["state"] == "unknown"
+    assert runner["needs_resume"] is False
     assert alias["last_error_code"] == "CODEX_DAEMON_TURN_STATE_UNCERTAIN"
 
 

@@ -1463,9 +1463,9 @@ def resolve_compatible_daemon_cli(
     """Select a CLI that can inspect the running app-server daemon.
 
     Reported CLI and app-server versions are diagnostics, not an admission
-    gate. The first available candidate must complete the daemon version probe;
-    socket safety and the later WebSocket ``initialize`` exchange remain the
-    compatibility boundary.
+    gate. Automatic discovery may try the next trusted CLI when one candidate
+    cannot perform the version probe. Socket safety and the later WebSocket
+    ``initialize`` exchange remain the compatibility boundary.
     """
 
     which_fn = shutil.which if which_command is None else which_command
@@ -1522,14 +1522,22 @@ def resolve_compatible_daemon_cli(
             "no Codex CLI executable is available for the shared daemon probe"
         )
 
-    candidate, source = candidates[0]
-    info = probe_fn(os.fspath(candidate))
-    return CompatibleDaemonCli(
-        path=candidate,
-        source=source,
-        info=info,
-        fallback_used=False,
-    )
+    for index, (candidate, source) in enumerate(candidates):
+        try:
+            info = probe_fn(os.fspath(candidate))
+        except DaemonSocketError:
+            raise
+        except DaemonProbeError:
+            if not automatic or index == len(candidates) - 1:
+                raise
+            continue
+        return CompatibleDaemonCli(
+            path=candidate,
+            source=source,
+            info=info,
+            fallback_used=index > 0,
+        )
+    raise AssertionError("daemon CLI candidate resolution did not terminate")
 
 
 def _is_executable_file(path: Path) -> bool:

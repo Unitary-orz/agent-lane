@@ -333,7 +333,9 @@ def test_run_timeout_returns_structured_recoverable_state(
     assert output["requested_model"] is None
     assert output["requested_model_source"] == "default-or-unset"
     assert output["requested_effort"] is None
-    assert output["requested_effort_source"] == "default-or-unset"
+    assert output["requested_effort_source"] == "unset"
+    assert output["effective_effort"] is None
+    assert output["effective_effort_source"] == "unset"
     assert output["runner_alive"] is False
     assert output["needs_resume"] is True
     assert alias["last_status"] == "timed_out"
@@ -407,6 +409,39 @@ def test_run_rejects_sensitive_config_key_before_starting_app_server(
     assert output["ok"] is False
     assert "potentially sensitive" in output["error"]
     assert fake.instances == []
+
+
+def test_run_accepts_non_secret_token_limit_config(
+    tmp_path, monkeypatch, capsys
+):
+    fake = FakeCodexAppServer
+    fake.instances = []
+    monkeypatch.setattr(cli, "CodexAppServer", fake)
+
+    rc = main(
+        [
+            "codex",
+            "run",
+            "--lane-id",
+            "token-limit-config",
+            "--alias-root",
+            str(tmp_path / "aliases"),
+            "--cwd",
+            str(tmp_path),
+            "--config",
+            "model_auto_compact_token_limit=100000",
+            "--commit-signing",
+            "off",
+            "--prompt",
+            "hello",
+        ]
+    )
+    output = decode_cli_output(capsys.readouterr().out)
+
+    assert rc == 0, output
+    assert fake.instances[0].config_overrides == [
+        "model_auto_compact_token_limit=100000"
+    ]
 
 
 @pytest.mark.skipif(

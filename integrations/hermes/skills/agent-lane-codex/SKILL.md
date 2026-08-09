@@ -1,7 +1,7 @@
 ---
 name: agent-lane-codex
-description: Delegate durable coding work to Codex through a stable agent-lane lane, then inspect and continue it without changing the parent runtime.
-version: 1.0.0-rc.1
+description: "Use agent-lane to start, inspect, continue, steer, and close out durable Codex coding tasks, including optional App Sync."
+version: 1.0.0-rc.2
 author: Unitary-orz
 license: MIT
 platforms: [macos]
@@ -16,8 +16,9 @@ metadata:
 
 # Agent Lane Codex
 
-Use this skill when a task should run in Codex while the parent agent remains
-responsible for user intent, authorization, progress reporting, and acceptance.
+This skill is the operational entrypoint for the public V1 CLI/JSON contract.
+Use it for Codex task selection, execution, continuity, monitoring, reporting,
+and acceptance through `agent-lane`.
 
 Operational commands are JSON-first. Except for discovery output from `--help`
 and `--version`, read `ok`, `error.code`, `data`, and `warnings`; do not parse
@@ -76,8 +77,26 @@ connection with `agent-lane doctor --mode app-sync --probe`.
 Do not enable App Sync, change login configuration, or ask the user to reopen
 Codex App unless that host-level change is authorized.
 
-The mode is fixed for a lane. Create another lane rather than attempting to
-change it in place.
+Ordinary execution does not change a lane's mode. To switch the same task
+between `independent` and `app-sync`, explicitly repeat `session attach` with
+the exact thread ID and requested `--mode`; do not create a second binding.
+
+## Configure a default effort when useful
+
+For a persistent user-level default, use agent-lane configuration rather than
+editing Codex configuration:
+
+```bash
+agent-lane config effort set xh
+agent-lane config effort status
+```
+
+Set or clear this persistent preference only when the user requested or
+authorized it; otherwise, pass a turn-scoped `--effort` when needed.
+`xh` normalizes to `xhigh`. An explicit `--effort` on `run`, `send`, or
+`goal run` overrides the user default. Read `effective_effort` and
+`effective_effort_source` from JSON instead of assuming which value Codex used.
+Use `agent-lane config effort clear` to remove the agent-lane default.
 
 ## Start or resume work
 
@@ -85,14 +104,16 @@ change it in place.
 
 ```bash
 agent-lane codex run \
-  --lane-id "<stable-lane-id>" \
+  --title "<human-facing-task-title>" \
   --mode independent \
   --cwd "<absolute-project-path>" \
   --prompt "<bounded task with acceptance criteria>"
 ```
 
-Reuse the same lane ID for the same durable task. Use `--prompt-file` for long
-or carefully quoted instructions.
+When no target is supplied, agent-lane generates the internal stable lane ID.
+Use the returned thread ID or another exact selector for later calls. Automation
+may still supply and reuse `--lane-id`. Use `--prompt-file` for long or
+carefully quoted instructions.
 
 Common optional controls:
 
@@ -112,21 +133,47 @@ Common optional controls:
 `--worktree` is valid on the first `run`. Treat cleanup, signing replacement,
 Git commit, push, and publication as separate permissions.
 
-## Continue an existing lane
+When `--effort` is omitted, do not copy the previous alias value into the next
+command. Let agent-lane resolve the current user default and verify its reported
+effective source.
+
+## Select one existing task
+
+For commands that operate on one task, prefer the exact `--thread-id` returned
+by discovery or an earlier result. The other selectors are:
+
+```text
+--target-title <exact-known-attached-title>
+--current
+--lane-id <internal-stable-id>
+```
+
+Title matching is exact and case-insensitive. `--current` means the only
+attached task whose stored workspace equals the current process directory; it
+does not mean the most recent task. Treat `CODEX_TARGET_AMBIGUOUS` as a required
+selection step and choose only from `choices[].target_argv`. Never guess among
+candidates. Read `target_resolution` to verify the requested and resolved
+identities. `CODEX_TARGET_CHANGED` means the binding changed after selection;
+rediscover instead of retrying control against the stale result.
+
+## Continue an existing task
 
 ```bash
 agent-lane codex send \
-  --lane-id "<stable-lane-id>" \
+  --thread-id "<selected-thread-id>" \
   --prompt "<follow-up>"
 ```
 
-Follow-ups require a lane ID. Direct `send --thread-id` was removed in V1.
+The thread must already be explicitly attached. An unbound control request must
+fail with `CODEX_TARGET_ATTACH_REQUIRED`; follow its separate `attach_argv`,
+inspect that result, then execute `after_attach_argv`. Do not combine these into
+an implicit takeover.
 
 For one active App Sync turn only:
 
 ```bash
 agent-lane codex steer \
-  --lane-id "<stable-lane-id>" \
+  --thread-id "<selected-thread-id>" \
   --prompt "<additional input>"
 ```
 
@@ -136,15 +183,22 @@ turn is absent, ambiguous, or changed.
 ## Observe without starting work
 
 ```bash
-agent-lane codex status --lane-id "<stable-lane-id>"
-agent-lane codex wait --lane-id "<stable-lane-id>" --timeout 600
-agent-lane codex checkpoint --lane-id "<stable-lane-id>" --after 300
-agent-lane codex closeout --lane-id "<stable-lane-id>"
+agent-lane codex status --thread-id "<selected-thread-id>"
+agent-lane codex wait --thread-id "<selected-thread-id>" --timeout 600
+agent-lane codex checkpoint --thread-id "<selected-thread-id>" --after 300
+agent-lane codex closeout --thread-id "<selected-thread-id>"
 ```
 
 Use `watch` only when the parent can consume JSONL polling snapshots. A timeout
 limits the observation window; it does not prove that the underlying task was
 cancelled or completed.
+
+For state decisions, read `execution.state`, `execution.active`,
+`execution.evidence`, and `execution.conflicts`. Active thread or live runner
+evidence takes precedence over cached `last_turn`, local runner state, and Goal
+status. Treat `runner_status` as the effective status and
+`local_runner_status` as local/cache evidence only. If `execution.state` is
+`unknown`, observe again; do not infer that a new `send` is safe.
 
 ## Discover or attach sessions
 
@@ -159,14 +213,25 @@ Stored observation is the default. If the parent requires current Codex state,
 request `--observe live` and surface any failure; do not silently substitute a
 cached view.
 
+Discovery, session inspection, and exact-thread `status`, `wait`, `checkpoint`,
+`closeout`, and `goal get` are read-only and do not require a lane. Inspect the
+returned `control`: `requires_explicit_attach: true` means the task is not
+controllable through agent-lane yet, and `attach_argv` gives a machine-readable
+explicit next step.
+
 Attach an existing task explicitly:
 
 ```bash
 agent-lane codex session attach \
-  --lane-id "<stable-lane-id>" \
-  --thread-id "<task-id>" \
-  --mode independent
+  --thread-id "<task-id>"
 ```
+
+The omitted mode defaults to `independent`; pass `--mode app-sync` explicitly
+when shared App control is required. Attach creates only the lane binding and
+returns `control.send_target_argv`; it never starts a turn. When no lane ID is
+supplied, it generates a deterministic internal binding ID and repeated attach
+of that thread reuses it. Follow-up execution is a separate `send` against the
+exact thread target.
 
 Use `session name get/set` to read or change the task name. Do not infer that a
 name observed in one store has been written to another; live read-back is an
@@ -176,12 +241,12 @@ explicit operation.
 
 ```bash
 agent-lane codex goal set \
-  --lane-id "<stable-lane-id>" \
+  --title "<human-facing-task-title>" \
   --cwd "<absolute-project-path>" \
   --objective "<durable objective>"
 
 agent-lane codex goal run \
-  --lane-id "<stable-lane-id>" \
+  --thread-id "<selected-thread-id>" \
   --max-turns 20 \
   --max-runtime 7200
 ```
@@ -191,10 +256,13 @@ limits bound automation; they are not acceptance evidence.
 
 ## Report back to the parent
 
-Report the stable lane ID, current state, material artifacts, validation
-evidence, blockers, and whether another turn remains. Distinguish clearly among:
+Report the human-facing task identity, exact thread target, current state,
+material artifacts, validation evidence, blockers, and whether another turn
+remains. Retain the stable lane ID as machine metadata when useful, but do not
+make the human remember it. Distinguish clearly among:
 
 - a task still running;
+- an unknown execution state or reported state conflict;
 - a completed Codex turn;
 - tests that passed;
 - a local Git commit;
@@ -209,7 +277,7 @@ Cleanup is only for an agent-lane-owned managed worktree:
 
 ```bash
 agent-lane codex cleanup \
-  --lane-id "<stable-lane-id>" \
+  --thread-id "<selected-thread-id>" \
   --confirm-thread-inactive
 ```
 

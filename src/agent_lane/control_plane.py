@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import subprocess
 import time
+import uuid
 from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
@@ -42,7 +44,16 @@ from .state import (
     alias_path,
     list_aliases,
     load_alias,
+    safe_lane_id,
     save_alias as _save_alias_file,
+)
+from .settings import (
+    UserConfigError,
+    clear_default_effort,
+    normalize_effort,
+    read_default_effort,
+    set_default_effort,
+    user_config_path,
 )
 from .workspace import (
     WorkspaceError,
@@ -57,13 +68,15 @@ CODEX_PROVIDER = "codex"
 CODEX_ALIAS_SCHEMA_VERSION = 3
 EXECUTION_MODES = ("independent", "app-sync")
 COMMIT_SIGNING_MODES = ("off", "agent")
-SENSITIVE_CONFIG_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "credential",
-    "password",
-    "secret",
-    "token",
+SENSITIVE_CONFIG_KEY_PARTS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "credential",
+        "password",
+        "secret",
+        "token",
+    }
 )
 READ_ONLY_STDIO_FALLBACK_ERRORS = frozenset(
     {
@@ -76,6 +89,37 @@ READ_ONLY_STDIO_FALLBACK_ERRORS = frozenset(
 )
 SESSION_LIST_MAX_PAGES = 100
 STEER_LOCK_ROOT = DEFAULT_ALIAS_ROOT
+
+LANE_TARGET_HANDLERS = frozenset(
+    {
+        "codex.run",
+        "codex.send",
+        "codex.steer",
+        "codex.status",
+        "codex.closeout",
+        "codex.cleanup",
+        "codex.wait",
+        "codex.watch",
+        "codex.checkpoint",
+        "codex.session.name.set",
+        "codex.goal.set",
+        "codex.goal.run",
+        "codex.goal.get",
+        "codex.goal.complete",
+        "codex.goal.clear",
+    }
+)
+CREATE_WITHOUT_TARGET_HANDLERS = frozenset({"codex.run", "codex.goal.set"})
+READ_ONLY_UNBOUND_TARGET_HANDLERS = frozenset(
+    {
+        "codex.status",
+        "codex.closeout",
+        "codex.wait",
+        "codex.watch",
+        "codex.checkpoint",
+        "codex.goal.get",
+    }
+)
 
 
 def save_alias(
@@ -125,6 +169,45 @@ def cmd_app_sync_login(args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, **app_sync_login(codex_bin=args.codex_bin)}
 
 
+def cmd_effort_set(args: argparse.Namespace) -> dict[str, Any]:
+    setting = _user_effort_operation(set_default_effort, args.value)
+    return {"ok": True, "operation": "effort.set", **setting}
+
+
+def cmd_effort_status(_args: argparse.Namespace) -> dict[str, Any]:
+    setting = _user_effort_operation(read_default_effort)
+    return {"ok": True, "operation": "effort.status", **setting}
+
+
+def cmd_effort_clear(_args: argparse.Namespace) -> dict[str, Any]:
+    setting = _user_effort_operation(clear_default_effort)
+    return {"ok": True, "operation": "effort.clear", **setting}
+
+
+def _user_effort_operation(operation: Callable[..., dict[str, Any]], *args: Any) -> dict[str, Any]:
+    try:
+        result = operation(*args)
+    except UserConfigError as exc:
+        raise WorkspaceError(
+            "USER_CONFIG_INVALID",
+            str(exc),
+            config_path=str(user_config_path()),
+            retryable=False,
+        ) from exc
+    except OSError as exc:
+        raise WorkspaceError(
+            "USER_CONFIG_WRITE_FAILED",
+            f"could not update user config: {exc}",
+            config_path=str(user_config_path()),
+            retryable=False,
+        ) from exc
+    return {
+        "effective_effort": result["value"],
+        "effective_effort_source": result["source"],
+        "config_path": str(result["path"]),
+    }
+
+
 def cmd_status_v1(args: argparse.Namespace) -> dict[str, Any]:
     args.include_turns = args.detail == "turns"
     args.brief = args.detail == "summary"
@@ -151,9 +234,16 @@ def cmd_session_find_v1(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_session_name_get_v1(args: argparse.Namespace) -> dict[str, Any]:
-    if getattr(args, "lane_id", None):
+    alias, thread_id = _resolve_thread_target(args)
+    if isinstance(alias, dict):
+        args.lane_id = alias.get("lane_id")
         return cmd_codex_name_get(args)
-    thread_id = str(getattr(args, "thread_id", "") or "").strip()
+    if not thread_id:
+        raise WorkspaceError(
+            "CODEX_TARGET_NOT_FOUND",
+            "the selected task does not expose a Codex thread id",
+            retryable=False,
+        )
     codex, transport = _open_read_only_codex(args.observe)
     with codex:
         result = codex.read_thread(thread_id, include_turns=False)
@@ -174,6 +264,7 @@ def _command_locks(args: argparse.Namespace) -> ExitStack:
     try:
         if getattr(args, "provider", None) != CODEX_PROVIDER:
             return stack
+        _prepare_command_target(args)
         handler = str(getattr(args, "handler", ""))
         lane_id = getattr(args, "lane_id", None)
         if not lane_id:
@@ -195,10 +286,398 @@ def _command_locks(args: argparse.Namespace) -> ExitStack:
             "codex.goal.clear",
         }:
             stack.enter_context(operation_lock(alias_root, str(lane_id)))
+        expected_thread_id = _nonempty_text(
+            getattr(args, "_target_expected_thread_id", None)
+        )
+        if expected_thread_id is not None:
+            current = load_alias(CODEX_PROVIDER, str(lane_id), alias_root)
+            observed_thread_id = _nonempty_text(
+                (current or {}).get("codex_thread_id")
+            )
+            if observed_thread_id != expected_thread_id:
+                raise WorkspaceError(
+                    "CODEX_TARGET_CHANGED",
+                    "the resolved task binding changed before the command began",
+                    lane_id=lane_id,
+                    expected_thread_id=expected_thread_id,
+                    observed_thread_id=observed_thread_id,
+                    retryable=False,
+                )
         return stack
     except Exception:
         stack.close()
         raise
+
+
+def _prepare_command_target(args: argparse.Namespace) -> None:
+    if getattr(args, "_target_prepared", False):
+        return
+    args._target_prepared = True
+    handler = str(getattr(args, "handler", ""))
+    if handler == "codex.session.attach":
+        _prepare_attach_target(args)
+        return
+    if handler not in LANE_TARGET_HANDLERS:
+        return
+
+    alias_root = Path(args.alias_root).expanduser()
+    requested = _requested_target(args)
+    if requested is None:
+        if handler not in CREATE_WITHOUT_TARGET_HANDLERS:
+            return
+        lane_id = _new_internal_lane_id(alias_root)
+        args.lane_id = lane_id
+        if _nonempty_text(getattr(args, "title", None)) is None:
+            raw_cwd = _nonempty_text(getattr(args, "cwd", None))
+            if raw_cwd is not None:
+                default_title = Path(raw_cwd).expanduser().name
+                if default_title:
+                    args.title = default_title
+        args._target_resolution = {
+            "requested": {"kind": "new", "value": None},
+            "source": "generated_internal",
+            "user_supplied_lane_id": False,
+            "resolved": {"lane_id": lane_id, "thread_id": None},
+        }
+        return
+
+    kind = str(requested["kind"])
+    value = requested["value"]
+    if kind == "lane_id":
+        lane_id = str(value)
+        alias = _load_target_alias(alias_root, lane_id)
+        thread_id = _nonempty_text((alias or {}).get("codex_thread_id"))
+        args._target_resolution = {
+            "requested": requested,
+            "source": "explicit_lane_id",
+            "user_supplied_lane_id": True,
+            "resolved": {
+                "lane_id": lane_id,
+                "thread_id": thread_id,
+            },
+        }
+        args._target_expected_thread_id = thread_id
+        return
+
+    matches = _target_alias_matches(
+        alias_root,
+        kind=kind,
+        value=str(value),
+        allow_invalid_registry=(
+            kind == "thread_id" and handler in READ_ONLY_UNBOUND_TARGET_HANDLERS
+        ),
+    )
+    if len(matches) > 1:
+        raise _ambiguous_target_error(
+            requested,
+            matches,
+            alias_root=alias_root,
+        )
+    if len(matches) == 1:
+        alias = matches[0]
+        lane_id = str(alias["lane_id"])
+        thread_id = _nonempty_text(alias.get("codex_thread_id"))
+        args.lane_id = lane_id
+        args._target_resolution = {
+            "requested": requested,
+            "source": {
+                "thread_id": "thread_binding",
+                "title": "exact_title",
+                "current": "current_cwd",
+            }[kind],
+            "user_supplied_lane_id": False,
+            "resolved": {"lane_id": lane_id, "thread_id": thread_id},
+        }
+        args._target_expected_thread_id = thread_id
+        return
+
+    if kind == "thread_id" and handler in READ_ONLY_UNBOUND_TARGET_HANDLERS:
+        thread_id = str(value)
+        args.lane_id = None
+        args._direct_thread_id = thread_id
+        args._target_resolution = {
+            "requested": requested,
+            "source": "unbound_thread_read_only",
+            "user_supplied_lane_id": False,
+            "resolved": {"lane_id": None, "thread_id": thread_id},
+        }
+        return
+    if kind == "thread_id":
+        raise _attach_required_error(args, handler, str(value))
+    raise WorkspaceError(
+        "CODEX_TARGET_NOT_FOUND",
+        "no attached Codex task matches the requested target",
+        requested_target=requested,
+        discover_argv=["codex", "session", "list", "--scope", "all"],
+        retryable=False,
+    )
+
+
+def _prepare_attach_target(args: argparse.Namespace) -> None:
+    alias_root = Path(args.alias_root).expanduser()
+    thread_id = str(getattr(args, "thread_id", "") or "").strip()
+    if not thread_id:
+        return
+    requested_lane_id = _nonempty_text(getattr(args, "lane_id", None))
+    if requested_lane_id is not None:
+        _load_target_alias(alias_root, requested_lane_id)
+        args.lane_id = requested_lane_id
+        args._target_resolution = {
+            "requested": {"kind": "thread_id", "value": thread_id},
+            "source": "explicit_lane_id",
+            "user_supplied_lane_id": True,
+            "resolved": {
+                "lane_id": requested_lane_id,
+                "thread_id": thread_id,
+            },
+        }
+        return
+    matches = _target_alias_matches(
+        alias_root,
+        kind="thread_id",
+        value=thread_id,
+    )
+    if len(matches) > 1:
+        raise _ambiguous_target_error(
+            {"kind": "thread_id", "value": thread_id},
+            matches,
+            alias_root=alias_root,
+        )
+    if matches:
+        lane_id = str(matches[0]["lane_id"])
+        source = "thread_binding"
+    else:
+        lane_id = _internal_lane_id_for_thread(thread_id)
+        source = "generated_for_attach"
+    args.lane_id = lane_id
+    args._target_resolution = {
+        "requested": {"kind": "thread_id", "value": thread_id},
+        "source": source,
+        "user_supplied_lane_id": False,
+        "resolved": {"lane_id": lane_id, "thread_id": thread_id},
+    }
+
+
+def _requested_target(args: argparse.Namespace) -> dict[str, Any] | None:
+    prepared = getattr(args, "_target_resolution", None)
+    if isinstance(prepared, dict):
+        requested = prepared.get("requested")
+        if isinstance(requested, dict) and requested.get("kind") not in {
+            None,
+            "new",
+        }:
+            return dict(requested)
+    lane_id = _nonempty_text(getattr(args, "lane_id", None))
+    if lane_id is not None:
+        return {"kind": "lane_id", "value": lane_id}
+    thread_id = _nonempty_text(getattr(args, "thread_id", None))
+    if thread_id is not None:
+        return {"kind": "thread_id", "value": thread_id}
+    title = _nonempty_text(getattr(args, "target_title", None))
+    if title is not None:
+        return {"kind": "title", "value": title}
+    if bool(getattr(args, "current", False)):
+        return {"kind": "current", "value": str(Path.cwd().resolve())}
+    return None
+
+
+def _target_alias_matches(
+    alias_root: Path,
+    *,
+    kind: str,
+    value: str,
+    allow_invalid_registry: bool = False,
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    requested_title = value.casefold()
+    requested_cwd = (
+        Path(value).expanduser().resolve(strict=False)
+        if kind == "current"
+        else None
+    )
+    for raw in _target_alias_registry(
+        alias_root,
+        allow_invalid=allow_invalid_registry,
+    ):
+        alias = dict(raw)
+        alias.pop("_path", None)
+        lane_id = _nonempty_text(alias.get("lane_id"))
+        if lane_id is None:
+            continue
+        matched = False
+        if kind == "thread_id":
+            matched = _nonempty_text(alias.get("codex_thread_id")) == value
+        elif kind == "title":
+            titles = {
+                title.casefold()
+                for title in (
+                    _nonempty_text(alias.get("codex_title")),
+                    _nonempty_text(alias.get("lane_label")),
+                    _nonempty_text(alias.get("title")),
+                )
+                if title is not None
+            }
+            matched = requested_title in titles
+        elif kind == "current":
+            raw_cwd = _nonempty_text(alias.get("cwd"))
+            matched = bool(
+                raw_cwd
+                and Path(raw_cwd).expanduser().resolve(strict=False)
+                == requested_cwd
+            )
+        if matched:
+            matches.append(alias)
+    return sorted(matches, key=lambda item: str(item.get("lane_id") or ""))
+
+
+def _target_alias_registry(
+    alias_root: Path,
+    *,
+    allow_invalid: bool = False,
+) -> list[dict[str, Any]]:
+    items = list_aliases(CODEX_PROVIDER, alias_root)
+    invalid_entries = [
+        {
+            "path": str(item.get("_path") or ""),
+            "error": str(item.get("error") or "invalid alias entry"),
+        }
+        for item in items
+        if item.get("error")
+    ]
+    if invalid_entries and not allow_invalid:
+        raise WorkspaceError(
+            "CODEX_TARGET_REGISTRY_INVALID",
+            "cannot safely resolve a task while the lane registry contains "
+            "unreadable entries",
+            invalid_entries=invalid_entries,
+            retryable=False,
+        )
+
+    aliases: list[dict[str, Any]] = []
+    for raw in items:
+        alias = dict(raw)
+        if _nonempty_text(alias.get("lane_id")) is None:
+            raw_path = _nonempty_text(alias.get("_path"))
+            if raw_path is not None:
+                alias["lane_id"] = Path(raw_path).stem
+        aliases.append(alias)
+    return aliases
+
+
+def _load_target_alias(
+    alias_root: Path,
+    lane_id: str,
+) -> dict[str, Any] | None:
+    try:
+        return load_alias(CODEX_PROVIDER, lane_id, alias_root)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkspaceError(
+            "CODEX_TARGET_REGISTRY_INVALID",
+            "cannot safely resolve a task because its lane alias is unreadable",
+            invalid_entries=[
+                {
+                    "path": str(alias_path(CODEX_PROVIDER, lane_id, alias_root)),
+                    "error": str(exc),
+                }
+            ],
+            retryable=False,
+        ) from exc
+
+
+def _target_choice(
+    alias: dict[str, Any],
+    *,
+    alias_root: Path,
+) -> dict[str, Any]:
+    thread_id = _nonempty_text(alias.get("codex_thread_id"))
+    lane_id = str(alias.get("lane_id") or "")
+    target_argv = (
+        ["--thread-id", thread_id]
+        if thread_id is not None
+        else ["--lane-id", lane_id]
+    )
+    target_argv.extend(_alias_root_argv(alias_root))
+    return {
+        "lane_id": lane_id,
+        "thread_id": thread_id,
+        "title": _title_contract(alias, lane_id=lane_id)["title"],
+        "target_argv": target_argv,
+    }
+
+
+def _ambiguous_target_error(
+    requested: dict[str, Any],
+    matches: list[dict[str, Any]],
+    *,
+    alias_root: Path,
+) -> WorkspaceError:
+    return WorkspaceError(
+        "CODEX_TARGET_AMBIGUOUS",
+        "the requested target matches more than one attached Codex task",
+        requested_target=requested,
+        choices=[
+            _target_choice(alias, alias_root=alias_root) for alias in matches
+        ],
+        retryable=False,
+    )
+
+
+def _alias_root_argv(alias_root: str | Path | None) -> list[str]:
+    if alias_root is None:
+        return []
+    resolved = Path(alias_root).expanduser().resolve(strict=False)
+    default = DEFAULT_ALIAS_ROOT.expanduser().resolve(strict=False)
+    if resolved == default:
+        return []
+    return ["--alias-root", str(resolved)]
+
+
+def _attach_required_error(
+    args: argparse.Namespace,
+    handler: str,
+    thread_id: str,
+) -> WorkspaceError:
+    raw_argv = getattr(args, "_raw_argv", None)
+    after_attach_argv = (
+        [str(value) for value in raw_argv]
+        if isinstance(raw_argv, list) and raw_argv
+        else [*handler.split("."), "--thread-id", thread_id]
+    )
+    attach_argv = [
+        "codex",
+        "session",
+        "attach",
+        "--thread-id",
+        thread_id,
+    ]
+    if handler == "codex.steer":
+        attach_argv.extend(["--mode", "app-sync"])
+    attach_argv.extend(_alias_root_argv(getattr(args, "alias_root", None)))
+    return WorkspaceError(
+        "CODEX_TARGET_ATTACH_REQUIRED",
+        "the selected Codex task is read-only until it is explicitly attached",
+        requested_target={"kind": "thread_id", "value": thread_id},
+        control_created=False,
+        attach_argv=attach_argv,
+        after_attach_argv=after_attach_argv,
+        retryable=False,
+    )
+
+
+def _new_internal_lane_id(alias_root: Path) -> str:
+    while True:
+        lane_id = f"task-{uuid.uuid4().hex}"
+        if load_alias(CODEX_PROVIDER, lane_id, alias_root) is None:
+            return lane_id
+
+
+def _internal_lane_id_for_thread(thread_id: str) -> str:
+    try:
+        prefix = safe_lane_id(thread_id).casefold()[:48]
+    except ValueError:
+        prefix = "session"
+    digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
+    return f"session-{prefix}-{digest}"
 
 
 
@@ -486,6 +965,7 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
             )
         except TimeoutError as exc:
             return _turn_timeout_result(
+                codex=codex,
                 alias=alias,
                 alias_root=alias_root,
                 lane_id=args.lane_id,
@@ -505,6 +985,13 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
     runner = _runner_state(
         alias,
         goal if goal_tracking else alias.get("goal"),
+        thread_active=False,
+        thread_observed=True,
+        observed_turn={
+            "turn_id": turn.turn_id,
+            "status": turn.status,
+            "final_text": turn.final_text,
+        },
     )
     path = save_alias(CODEX_PROVIDER, args.lane_id, alias, alias_root)
     result = {
@@ -532,8 +1019,7 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
         "commit_signing": commit_signing["metadata"],
         "turn_id": turn.turn_id,
         "status": turn.status,
-        "runner_alive": runner["alive"],
-        "needs_resume": runner["needs_resume"],
+        **_execution_fields(runner),
         "final_text": turn.final_text,
         "events": turn.events[-20:],
     }
@@ -602,7 +1088,14 @@ def cmd_codex_steer(args: argparse.Namespace) -> dict[str, Any]:
             execution_mode=execution_mode,
             retryable=False,
         )
-    target_source = "lane" if getattr(args, "lane_id", None) else "thread"
+    requested_target = _requested_target(args) or {}
+    target_source = {
+        "lane_id": "lane",
+        "thread_id": "thread",
+        "title": "title",
+        "current": "current",
+    }.get(str(requested_target.get("kind")), "lane")
+    expected_lane_id = _nonempty_text((alias or {}).get("lane_id"))
     try:
         prompt = _read_prompt(args)
     except (OSError, UnicodeError) as exc:
@@ -657,18 +1150,24 @@ def cmd_codex_steer(args: argparse.Namespace) -> dict[str, Any]:
             namespace="steer",
             wait_timeout=args.timeout,
         ):
-            if target_source == "lane":
-                current_alias, current_thread_id = _resolve_thread_target(args)
-                if current_thread_id != thread_id:
-                    raise WorkspaceError(
-                        "CODEX_STEER_TARGET_CHANGED",
-                        "lane thread binding changed before steering",
-                        lane_id=args.lane_id,
-                        expected_thread_id=thread_id,
-                        observed_thread_id=current_thread_id,
-                        retryable=False,
-                    )
-                alias = current_alias
+            current_alias, current_thread_id = _resolve_thread_target(args)
+            observed_lane_id = _nonempty_text(
+                (current_alias or {}).get("lane_id")
+            )
+            if (
+                current_thread_id != thread_id
+                or observed_lane_id != expected_lane_id
+            ):
+                raise WorkspaceError(
+                    "CODEX_STEER_TARGET_CHANGED",
+                    "task binding changed before steering",
+                    expected_lane_id=expected_lane_id,
+                    observed_lane_id=observed_lane_id,
+                    expected_thread_id=thread_id,
+                    observed_thread_id=current_thread_id,
+                    retryable=False,
+                )
+            alias = current_alias
 
             latest_snapshot = codex.read_thread(thread_id, include_turns=True)
             latest_thread = latest_snapshot.get("thread")
@@ -731,7 +1230,7 @@ def cmd_codex_steer(args: argparse.Namespace) -> dict[str, Any]:
 
 def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
     alias_root = Path(args.alias_root).expanduser()
-    existing = _require_alias(args.lane_id, alias_root)
+    existing = _require_command_alias(args, alias_root)
     execution_mode, resolved_mode_source = _resolve_execution_mode(None, existing)
     execution_mode_source = str(
         existing.get("execution_mode_source") or resolved_mode_source
@@ -831,6 +1330,7 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
             )
         except TimeoutError as exc:
             return _turn_timeout_result(
+                codex=codex,
                 alias=alias,
                 alias_root=alias_root,
                 lane_id=args.lane_id,
@@ -859,7 +1359,17 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
     alias["commit_signing"] = commit_signing["metadata"]
     if goal is not None or "goal_refresh_error" not in alias:
         _update_goal_alias(alias, goal)
-    runner = _runner_state(alias, goal)
+    runner = _runner_state(
+        alias,
+        goal,
+        thread_active=False,
+        thread_observed=True,
+        observed_turn={
+            "turn_id": turn.turn_id,
+            "status": turn.status,
+            "final_text": turn.final_text,
+        },
+    )
     path = save_alias(CODEX_PROVIDER, args.lane_id, alias, alias_root)
     result = {
         "ok": True,
@@ -886,8 +1396,7 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
         "commit_signing": commit_signing["metadata"],
         "turn_id": turn.turn_id,
         "status": turn.status,
-        "runner_alive": runner["alive"],
-        "needs_resume": runner["needs_resume"],
+        **_execution_fields(runner),
         "goal": goal,
         "final_text": turn.final_text,
         "events": turn.events[-20:],
@@ -904,8 +1413,18 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_codex_status(args: argparse.Namespace) -> dict[str, Any]:
+    direct_thread_id = _nonempty_text(
+        getattr(args, "_direct_thread_id", None)
+    )
+    if direct_thread_id is not None:
+        return _direct_thread_status(
+            direct_thread_id,
+            include_turns=bool(args.include_turns),
+            brief=bool(getattr(args, "brief", False)),
+            alias_root=Path(args.alias_root).expanduser(),
+        )
     alias_root = Path(args.alias_root).expanduser()
-    alias = dict(_require_alias(args.lane_id, alias_root))
+    alias = dict(_require_command_alias(args, alias_root))
     thread_id = str(alias["codex_thread_id"])
     execution_mode, execution_mode_source = _resolve_execution_mode(None, alias)
     with _codex_for_alias(alias) as codex:
@@ -922,7 +1441,8 @@ def cmd_codex_status(args: argparse.Namespace) -> dict[str, Any]:
     runner = _runner_state(
         alias,
         goal,
-        thread_active=_thread_has_active_turn(thread_obj),
+        thread=thread_obj,
+        goal_source=fallback["goal_status_source"],
     )
     result = {
         "ok": True,
@@ -940,13 +1460,7 @@ def cmd_codex_status(args: argparse.Namespace) -> dict[str, Any]:
         "goal_tokens_used": _goal_value(goal, "tokensUsed"),
         "goal_time_used_seconds": _goal_value(goal, "timeUsedSeconds"),
         **_turn_request_echo(alias),
-        "runner_status": runner["status"],
-        "local_runner_status": runner["local_status"],
-        "runner_alive": runner["alive"],
-        "thread_active": runner["thread_active"],
-        "execution_active": runner["execution_active"],
-        "execution_source": runner["execution_source"],
-        "needs_resume": runner["needs_resume"],
+        **_execution_fields(runner),
         "last_status": alias.get("last_status"),
         "last_completed_final_lead": _last_completed_final_lead(alias),
         "current_turn_final_lead": _current_turn_final_lead(alias, runner),
@@ -963,12 +1477,20 @@ def cmd_codex_status(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_codex_closeout(args: argparse.Namespace) -> dict[str, Any]:
+    direct_thread_id = _nonempty_text(
+        getattr(args, "_direct_thread_id", None)
+    )
+    if direct_thread_id is not None:
+        return _direct_thread_closeout(
+            direct_thread_id,
+            alias_root=Path(args.alias_root).expanduser(),
+        )
     alias_root = Path(args.alias_root).expanduser()
-    alias = dict(_require_alias(args.lane_id, alias_root))
+    alias = dict(_require_command_alias(args, alias_root))
     thread_id = str(alias["codex_thread_id"])
     execution_mode, execution_mode_source = _resolve_execution_mode(None, alias)
     with _codex_for_alias(alias) as codex:
-        thread = codex.read_thread(thread_id, include_turns=False)
+        thread = codex.read_thread(thread_id, include_turns=True)
         goal = codex.get_goal(thread_id)
     thread_obj = thread.get("thread") or {}
     _sync_adopted_thread_cwd(alias, thread_obj)
@@ -979,7 +1501,8 @@ def cmd_codex_closeout(args: argparse.Namespace) -> dict[str, Any]:
     runner = _runner_state(
         alias,
         goal,
-        thread_active=_thread_has_active_turn(thread_obj),
+        thread=thread_obj,
+        goal_source=fallback["goal_status_source"],
     )
     cwd = alias.get("cwd")
     git = _git_snapshot(str(cwd) if cwd else None, include_details=True)
@@ -1019,13 +1542,7 @@ def cmd_codex_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "goal_tokens_used": _goal_value(goal, "tokensUsed"),
         "goal_time_used_seconds": _goal_value(goal, "timeUsedSeconds"),
         **_turn_request_echo(alias),
-        "runner_status": runner["status"],
-        "local_runner_status": runner["local_status"],
-        "runner_alive": runner["alive"],
-        "thread_active": runner["thread_active"],
-        "execution_active": runner["execution_active"],
-        "execution_source": runner["execution_source"],
-        "needs_resume": runner["needs_resume"],
+        **_execution_fields(runner),
         "last_status": last_status,
         "last_completed_final_lead": _last_completed_final_lead(alias),
         "current_turn_final_lead": _current_turn_final_lead(alias, runner),
@@ -1039,6 +1556,138 @@ def cmd_codex_closeout(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "summary": summary,
     }
+
+
+def _direct_thread_snapshot(
+    thread_id: str,
+    *,
+    include_turns: bool,
+    alias_root: Path,
+) -> dict[str, Any]:
+    codex, transport = _open_read_only_codex("auto")
+    with codex:
+        result = codex.read_thread(thread_id, include_turns=include_turns)
+        try:
+            goal = codex.get_goal(thread_id)
+            goal_source = "thread_goal_get"
+            goal_error = None
+        except Exception as exc:
+            goal = None
+            goal_source = "unavailable"
+            goal_error = str(exc)
+    thread = result.get("thread")
+    if not isinstance(thread, dict):
+        raise WorkspaceError(
+            "CODEX_TARGET_NOT_FOUND",
+            "Codex did not return the selected thread",
+            requested_target={"kind": "thread_id", "value": thread_id},
+            retryable=False,
+        )
+    alias = {
+        "codex_thread_id": thread_id,
+        "cwd": _nonempty_text(thread.get("cwd")),
+    }
+    runner = _runner_state(
+        alias,
+        goal if isinstance(goal, dict) else None,
+        thread=thread,
+        goal_source=goal_source,
+    )
+    snapshot = {
+        "ok": True,
+        "lane_id": None,
+        "codex_thread_id": thread_id,
+        "codex_url": f"codex://threads/{thread_id}",
+        "alias_path": None,
+        "execution_mode": None,
+        "execution_mode_source": "unattached",
+        **_title_contract({}, thread=thread),
+        "thread_status": thread.get("status") or {},
+        "goal_status": goal.get("status") if isinstance(goal, dict) else None,
+        "goal_status_source": goal_source,
+        "goal_tokens_used": _goal_value(goal, "tokensUsed"),
+        "goal_time_used_seconds": _goal_value(goal, "timeUsedSeconds"),
+        **_turn_request_echo(None),
+        **_execution_fields(runner),
+        "last_status": None,
+        "workspace": _workspace_status(alias.get("cwd"), None),
+        "alias": None,
+        "thread": result,
+        "goal": goal,
+        "runner": runner,
+        "control": _control_contract(
+            None,
+            thread_id,
+            thread=thread,
+            attach_mode=_execution_mode_from_transport(transport),
+            alias_root=alias_root,
+        ),
+        **transport,
+    }
+    if goal_error is not None:
+        snapshot["goal_refresh_error"] = goal_error
+    return snapshot
+
+
+def _direct_thread_status(
+    thread_id: str,
+    *,
+    include_turns: bool,
+    brief: bool,
+    alias_root: Path,
+) -> dict[str, Any]:
+    snapshot = _direct_thread_snapshot(
+        thread_id,
+        include_turns=include_turns,
+        alias_root=alias_root,
+    )
+    if not brief:
+        return snapshot
+    return {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"alias", "thread", "goal"}
+    }
+
+
+def _direct_thread_closeout(thread_id: str, *, alias_root: Path) -> dict[str, Any]:
+    snapshot = _direct_thread_snapshot(
+        thread_id,
+        include_turns=True,
+        alias_root=alias_root,
+    )
+    thread = (snapshot.get("thread") or {}).get("thread") or {}
+    cwd = _nonempty_text(thread.get("cwd"))
+    git = _git_snapshot(cwd, include_details=True)
+    goal_status = snapshot.get("goal_status")
+    last_status = (snapshot.get("last_turn") or {}).get("status")
+    completed = goal_status == "complete" or (
+        goal_status is None and last_status == "completed"
+    )
+    if snapshot.get("execution_active"):
+        summary = "thread_active"
+    elif snapshot.get("needs_resume"):
+        summary = "needs_resume"
+    elif not git["is_repo"]:
+        summary = "not_git_repo"
+    elif completed and git["dirty"] is True:
+        summary = "complete_dirty"
+    elif completed and git["dirty"] is False:
+        summary = "complete_and_clean"
+    else:
+        summary = "unknown"
+    snapshot.pop("alias", None)
+    snapshot.pop("thread", None)
+    snapshot.pop("goal", None)
+    snapshot.update(
+        {
+            "cwd": cwd,
+            "last_status": last_status,
+            "git": git,
+            "summary": summary,
+        }
+    )
+    return snapshot
 
 
 def cmd_codex_cleanup(args: argparse.Namespace) -> dict[str, Any]:
@@ -1156,13 +1805,7 @@ def _status_brief(
         "goal_tokens_used": status.get("goal_tokens_used"),
         "goal_time_used_seconds": status.get("goal_time_used_seconds"),
         **_turn_request_echo(alias),
-        "runner_status": runner["status"],
-        "local_runner_status": runner["local_status"],
-        "runner_alive": runner["alive"],
-        "thread_active": runner["thread_active"],
-        "execution_active": runner["execution_active"],
-        "execution_source": runner["execution_source"],
-        "needs_resume": runner["needs_resume"],
+        **_execution_fields(runner),
         "last_status": alias.get("last_status"),
         "last_completed_final_lead": _last_completed_final_lead(alias),
         "current_turn_final_lead": _current_turn_final_lead(alias, runner),
@@ -1343,11 +1986,24 @@ def _is_thread_not_loaded_error(exc: CodexRpcError) -> bool:
 
 
 def cmd_codex_wait(args: argparse.Namespace) -> dict[str, Any]:
+    direct_thread_id = _nonempty_text(
+        getattr(args, "_direct_thread_id", None)
+    )
+    if direct_thread_id is not None:
+        return _wait_for_thread(
+            thread_id=direct_thread_id,
+            timeout=args.timeout,
+            poll_interval=args.poll_interval,
+            alias_root=Path(args.alias_root).expanduser(),
+        )
     return _wait_for_lane(
         lane_id=args.lane_id,
         alias_root=Path(args.alias_root).expanduser(),
         timeout=args.timeout,
         poll_interval=args.poll_interval,
+        expected_thread_id=_nonempty_text(
+            getattr(args, "_target_expected_thread_id", None)
+        ),
     )
 
 
@@ -1364,13 +2020,28 @@ def cmd_codex_watch(args: argparse.Namespace) -> dict[str, Any]:
         )
         print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
 
-    result = _wait_for_lane(
-        lane_id=args.lane_id,
-        alias_root=Path(args.alias_root).expanduser(),
-        timeout=args.timeout,
-        poll_interval=args.poll_interval,
-        emit=emit,
+    direct_thread_id = _nonempty_text(
+        getattr(args, "_direct_thread_id", None)
     )
+    if direct_thread_id is not None:
+        result = _wait_for_thread(
+            thread_id=direct_thread_id,
+            timeout=args.timeout,
+            poll_interval=args.poll_interval,
+            alias_root=Path(args.alias_root).expanduser(),
+            emit=emit,
+        )
+    else:
+        result = _wait_for_lane(
+            lane_id=args.lane_id,
+            alias_root=Path(args.alias_root).expanduser(),
+            timeout=args.timeout,
+            poll_interval=args.poll_interval,
+            emit=emit,
+            expected_thread_id=_nonempty_text(
+                getattr(args, "_target_expected_thread_id", None)
+            ),
+        )
     return {
         "event": "completed",
         "diagnostic": True,
@@ -1385,14 +2056,29 @@ def cmd_codex_checkpoint(args: argparse.Namespace) -> dict[str, Any]:
     started_at = time.monotonic()
     if delay:
         time.sleep(delay)
-    alias_root = Path(args.alias_root).expanduser()
-    alias = _require_alias(args.lane_id, alias_root)
-    with _codex_for_alias(alias) as codex:
-        observation = _lane_observation(
-            codex,
-            args.lane_id,
-            alias_root,
-        )
+    direct_thread_id = _nonempty_text(
+        getattr(args, "_direct_thread_id", None)
+    )
+    if direct_thread_id is not None:
+        codex, _transport = _open_read_only_codex("auto")
+        with codex:
+            observation = _thread_observation(
+                codex,
+                direct_thread_id,
+                alias_root=Path(args.alias_root).expanduser(),
+            )
+    else:
+        alias_root = Path(args.alias_root).expanduser()
+        alias = _require_command_alias(args, alias_root)
+        with _codex_for_alias(alias) as codex:
+            observation = _lane_observation(
+                codex,
+                args.lane_id,
+                alias_root,
+                expected_thread_id=_nonempty_text(
+                    getattr(args, "_target_expected_thread_id", None)
+                ),
+            )
 
     ok = "observation_error" not in observation
     result = {
@@ -1501,7 +2187,10 @@ def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
             "refreshed": bool(args.refresh),
             "include_last_turn": False,
             **_project_grouped_output(
-                [_alias_summary(item) for item in aliases[:limit]]
+                [
+                    _alias_summary(item, alias_root=alias_root)
+                    for item in aliases[:limit]
+                ]
             ),
         }
 
@@ -1582,6 +2271,7 @@ def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
             reverse=True,
         )[:limit]
         items = _strip_session_internal_fields(items)
+        items = _apply_control_context(items, transport, alias_root=alias_root)
         project_output = _project_grouped_output(items)
     hidden_active_goal_count = len(
         active_goal_thread_ids.difference(natural_thread_ids)
@@ -1662,7 +2352,10 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
             "refreshed": bool(args.refresh),
             "include_last_turn": False,
             **_project_grouped_output(
-                [_alias_summary(item) for item in matches]
+                [
+                    _alias_summary(item, alias_root=alias_root)
+                    for item in matches
+                ]
             ),
         }
 
@@ -1728,6 +2421,11 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
             reverse=True,
         )[:limit]
         matches = _strip_session_internal_fields(matches)
+        matches = _apply_control_context(
+            matches,
+            transport,
+            alias_root=alias_root,
+        )
         project_output = _project_grouped_output(matches)
     return {
         "ok": True,
@@ -1758,12 +2456,19 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--thread-id requires a non-empty value")
 
     existing = load_alias(CODEX_PROVIDER, args.lane_id, alias_root)
+    requested_mode = getattr(args, "mode", None)
     execution_mode, resolved_mode_source = _resolve_execution_mode(
-        getattr(args, "mode", None),
+        requested_mode,
         existing,
+        allow_rebind=True,
     )
-    execution_mode_source = str(
-        (existing or {}).get("execution_mode_source") or resolved_mode_source
+    execution_mode_source = (
+        resolved_mode_source
+        if requested_mode is not None
+        else str(
+            (existing or {}).get("execution_mode_source")
+            or resolved_mode_source
+        )
     )
     if existing and str(existing.get("codex_thread_id") or "") != thread_id:
         raise WorkspaceError(
@@ -1772,7 +2477,7 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
             lane_id=args.lane_id,
             codex_thread_id=existing.get("codex_thread_id"),
         )
-    for item in list_aliases(CODEX_PROVIDER, alias_root):
+    for item in _target_alias_registry(alias_root):
         if (
             str(item.get("codex_thread_id") or "") == thread_id
             and str(item.get("lane_id") or "") != args.lane_id
@@ -1826,6 +2531,12 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
             "workspace": workspace,
             "execution_mode": execution_mode,
             "execution_mode_source": execution_mode_source,
+            "control": _control_contract(
+                alias,
+                thread_id,
+                thread=thread,
+                alias_root=alias_root,
+            ),
         }
 
     raw_cwd = thread.get("cwd") or args.cwd
@@ -1835,6 +2546,10 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
             "CODEX_THREAD_CWD_REQUIRED",
             "thread does not expose a usable cwd; pass --cwd explicitly",
             codex_thread_id=thread_id,
+            control_created=False,
+            required_action="retry_explicit_attach_with_cwd",
+            required_option="--cwd",
+            retryable=False,
         )
 
     now = time.time()
@@ -1891,12 +2606,18 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
         "workspace": workspace,
         "execution_mode": execution_mode,
         "execution_mode_source": execution_mode_source,
+        "control": _control_contract(
+            alias,
+            thread_id,
+            thread=thread,
+            alias_root=alias_root,
+        ),
     }
 
 
 def cmd_codex_name_get(args: argparse.Namespace) -> dict[str, Any]:
     alias_root = Path(args.alias_root).expanduser()
-    alias = dict(_require_alias(args.lane_id, alias_root))
+    alias = dict(_require_command_alias(args, alias_root))
     thread_id = str(alias["codex_thread_id"])
     codex, transport = _open_read_only_codex(args.observe)
     with codex:
@@ -1943,7 +2664,7 @@ def cmd_codex_name_set(args: argparse.Namespace) -> dict[str, Any]:
         else None
     )
     alias_root = Path(args.alias_root).expanduser()
-    alias = dict(_require_alias(args.lane_id, alias_root))
+    alias = dict(_require_command_alias(args, alias_root))
     thread_id = str(alias["codex_thread_id"])
     with _codex_for_alias(alias) as codex:
         before_result = codex.read_thread(thread_id, include_turns=False)
@@ -2050,17 +2771,45 @@ def cmd_codex_read(args: argparse.Namespace) -> dict[str, Any]:
             thread_id,
             include_turns=include_turns or selecting_turn,
         )
+        try:
+            goal = codex.get_goal(thread_id)
+            goal_source = "thread_goal_get"
+        except Exception as exc:
+            goal = None
+            goal_source = "unavailable"
+            goal_error = str(exc)
+    thread = result.get("thread")
+    if not isinstance(thread, dict):
+        raise ValueError(f"Codex thread {thread_id!r} was not returned")
+    runner = _runner_state(
+        dict(alias or {}),
+        goal if isinstance(goal, dict) else None,
+        thread=thread,
+        goal_source=goal_source,
+    )
+    common = {
+        "goal_status": goal.get("status") if isinstance(goal, dict) else None,
+        "goal_status_source": goal_source,
+        **_execution_fields(runner),
+        "control": _control_contract(
+            alias,
+            thread_id,
+            thread=thread,
+            attach_mode=_execution_mode_from_transport(transport),
+            alias_root=Path(args.alias_root).expanduser(),
+        ),
+    }
+    if goal_source == "unavailable":
+        common["goal_refresh_error"] = goal_error
     if not selecting_turn:
         return {
             "ok": True,
             "alias": alias,
             "thread": result,
+            **common,
             **transport,
         }
 
-    thread = result.get("thread")
-    if not isinstance(thread, dict):
-        raise ValueError(f"Codex thread {thread_id!r} was not returned")
     turns = thread.get("turns")
     if not isinstance(turns, list):
         turns = []
@@ -2080,6 +2829,7 @@ def cmd_codex_read(args: argparse.Namespace) -> dict[str, Any]:
             "turn_index": selected_index,
         },
         "turn": selected,
+        **common,
         **transport,
     }
 
@@ -2088,28 +2838,186 @@ def _resolve_thread_target(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any] | None, str | None]:
     alias_root = Path(args.alias_root).expanduser()
-    lane_id = getattr(args, "lane_id", None)
-    if lane_id:
-        alias = load_alias(CODEX_PROVIDER, str(lane_id), alias_root)
+    requested = _requested_target(args)
+    if requested is None:
+        raise ValueError("one task target is required")
+    kind = str(requested["kind"])
+    value = str(requested["value"])
+    if kind == "lane_id":
+        alias = _load_target_alias(alias_root, value)
         if not alias:
-            raise ValueError(f"no alias found for lane-id {lane_id!r}")
+            raise ValueError(f"no alias found for lane-id {value!r}")
         raw_thread_id = alias.get("codex_thread_id")
         thread_id = str(raw_thread_id).strip() if raw_thread_id else None
+        args._target_resolution = {
+            "requested": requested,
+            "source": "explicit_lane_id",
+            "user_supplied_lane_id": True,
+            "resolved": {"lane_id": value, "thread_id": thread_id},
+        }
+        args._target_expected_thread_id = thread_id
         return alias, thread_id
 
-    thread_id = str(getattr(args, "thread_id", "") or "").strip()
-    if not thread_id:
-        raise ValueError("--thread-id requires a non-empty value")
-    for item in list_aliases(CODEX_PROVIDER, alias_root):
-        if str(item.get("codex_thread_id") or "") != thread_id:
-            continue
-        item_lane_id = item.get("lane_id")
-        if item_lane_id:
-            return load_alias(CODEX_PROVIDER, str(item_lane_id), alias_root), thread_id
-        alias = dict(item)
-        alias.pop("_path", None)
+    matches = _target_alias_matches(
+        alias_root,
+        kind=kind,
+        value=value,
+        allow_invalid_registry=kind == "thread_id",
+    )
+    if len(matches) > 1:
+        raise _ambiguous_target_error(
+            requested,
+            matches,
+            alias_root=alias_root,
+        )
+    if matches:
+        alias = matches[0]
+        thread_id = _nonempty_text(alias.get("codex_thread_id"))
+        args._target_resolution = {
+            "requested": requested,
+            "source": {
+                "thread_id": "thread_binding",
+                "title": "exact_title",
+                "current": "current_cwd",
+            }[kind],
+            "user_supplied_lane_id": False,
+            "resolved": {
+                "lane_id": alias.get("lane_id"),
+                "thread_id": thread_id,
+            },
+        }
+        args._target_expected_thread_id = thread_id
         return alias, thread_id
-    return None, thread_id
+    if kind == "thread_id":
+        args._target_resolution = {
+            "requested": requested,
+            "source": "unbound_thread_read_only",
+            "user_supplied_lane_id": False,
+            "resolved": {"lane_id": None, "thread_id": value},
+        }
+        return None, value
+    raise WorkspaceError(
+        "CODEX_TARGET_NOT_FOUND",
+        "no attached Codex task matches the requested target",
+        requested_target=requested,
+        discover_argv=["codex", "session", "list", "--scope", "all"],
+        retryable=False,
+    )
+
+
+def _control_contract(
+    alias: dict[str, Any] | None,
+    thread_id: str,
+    *,
+    thread: dict[str, Any] | None = None,
+    attach_mode: str | None = None,
+    alias_root: str | Path | None = None,
+) -> dict[str, Any]:
+    lane_id = _nonempty_text((alias or {}).get("lane_id"))
+    if lane_id is not None:
+        alias_root_argv = _alias_root_argv(alias_root)
+        return {
+            "binding_status": "attached",
+            "control_ready": True,
+            "requires_explicit_attach": False,
+            "lane_id": lane_id,
+            "thread_id": thread_id,
+            "suggested_lane_id": None,
+            "attach_argv": None,
+            "target_argv": ["--thread-id", thread_id, *alias_root_argv],
+            "lane_target_argv": ["--lane-id", lane_id, *alias_root_argv],
+            "send_target_argv": [
+                "codex",
+                "send",
+                "--thread-id",
+                thread_id,
+                *alias_root_argv,
+            ],
+        }
+
+    suggested_lane_id = _suggested_lane_id(thread or {}, thread_id)
+    attach_argv = [
+        "codex",
+        "session",
+        "attach",
+        "--thread-id",
+        thread_id,
+    ]
+    if attach_mode is not None:
+        attach_argv.extend(["--mode", attach_mode])
+    attach_argv.extend(_alias_root_argv(alias_root))
+    return {
+        "binding_status": "unattached",
+        "control_ready": False,
+        "requires_explicit_attach": True,
+        "lane_id": None,
+        "thread_id": thread_id,
+        "suggested_lane_id": suggested_lane_id,
+        "target_argv": ["--thread-id", thread_id],
+        "lane_target_argv": None,
+        "attach_argv": attach_argv,
+        "send_target_argv": None,
+        "after_attach_argv": None,
+    }
+
+
+def _execution_mode_from_transport(transport: dict[str, Any]) -> str | None:
+    observed = _nonempty_text(transport.get("app_server_transport"))
+    if observed == "daemon":
+        return "app-sync"
+    if observed == "stdio":
+        return "independent"
+    return None
+
+
+def _apply_control_context(
+    items: list[dict[str, Any]],
+    transport: dict[str, Any],
+    *,
+    alias_root: Path,
+) -> list[dict[str, Any]]:
+    attach_mode = _execution_mode_from_transport(transport)
+    for item in items:
+        control = item.get("control")
+        if not isinstance(control, dict):
+            continue
+        thread_id = _nonempty_text(control.get("thread_id"))
+        if thread_id is None:
+            continue
+        if control.get("binding_status") == "attached":
+            lane_id = _nonempty_text(control.get("lane_id"))
+            if lane_id is not None:
+                item["control"] = _control_contract(
+                    {"lane_id": lane_id},
+                    thread_id,
+                    alias_root=alias_root,
+                )
+            continue
+        if (
+            control.get("binding_status") != "unattached"
+            or attach_mode is None
+        ):
+            continue
+        item["control"] = _control_contract(
+            None,
+            thread_id,
+            attach_mode=attach_mode,
+            alias_root=alias_root,
+        )
+    return items
+
+
+def _suggested_lane_id(thread: dict[str, Any], thread_id: str) -> str:
+    raw = thread.get("name") or thread.get("preview")
+    if raw:
+        try:
+            candidate = safe_lane_id(str(raw)).casefold()[:64].rstrip(".-")
+        except ValueError:
+            candidate = ""
+        if candidate:
+            return candidate
+    suffix = safe_lane_id(thread_id)[:12].casefold() if thread_id else "new"
+    return f"lane-{suffix}"
 
 
 def _select_turn(
@@ -2254,7 +3162,7 @@ def cmd_codex_goal_run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--max-turns must be greater than zero")
 
     alias_root = Path(args.alias_root).expanduser()
-    existing = _require_alias(args.lane_id, alias_root)
+    existing = _require_command_alias(args, alias_root)
     execution_mode, resolved_mode_source = _resolve_execution_mode(None, existing)
     execution_mode_source = str(
         existing.get("execution_mode_source") or resolved_mode_source
@@ -2356,9 +3264,7 @@ def cmd_codex_goal_run(args: argparse.Namespace) -> dict[str, Any]:
             "goal": goal,
             "goal_status": goal_status,
             "completed": goal_status == "complete",
-            "runner_status": runner["status"],
-            "runner_alive": runner["alive"],
-            "needs_resume": runner["needs_resume"],
+            **_execution_fields(runner),
             "turn_count": len(turns),
             "turns": turns,
             "goal_run_receipt": receipt,
@@ -2648,8 +3554,27 @@ def cmd_codex_signing_stop(_args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_codex_goal_get(args: argparse.Namespace) -> dict[str, Any]:
+    direct_thread_id = _nonempty_text(
+        getattr(args, "_direct_thread_id", None)
+    )
+    if direct_thread_id is not None:
+        snapshot = _direct_thread_snapshot(
+            direct_thread_id,
+            include_turns=False,
+            alias_root=Path(args.alias_root).expanduser(),
+        )
+        return {
+            "ok": True,
+            "lane_id": None,
+            "codex_thread_id": direct_thread_id,
+            "codex_url": f"codex://threads/{direct_thread_id}",
+            "alias_path": None,
+            **_execution_fields(snapshot["runner"]),
+            "goal": snapshot.get("goal"),
+            "control": snapshot["control"],
+        }
     alias_root = Path(args.alias_root).expanduser()
-    alias = _require_alias(args.lane_id, alias_root)
+    alias = _require_command_alias(args, alias_root)
     thread_id = str(alias["codex_thread_id"])
     with _codex_for_alias(alias) as codex:
         goal = codex.get_goal(thread_id)
@@ -2674,7 +3599,7 @@ def cmd_codex_goal_complete(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_codex_goal_clear(args: argparse.Namespace) -> dict[str, Any]:
     alias_root = Path(args.alias_root).expanduser()
-    alias = _require_alias(args.lane_id, alias_root)
+    alias = _require_command_alias(args, alias_root)
     thread_id = str(alias["codex_thread_id"])
     with _codex_for_alias(alias) as codex:
         result = codex.clear_goal(thread_id)
@@ -2697,7 +3622,7 @@ def cmd_codex_goal_clear(args: argparse.Namespace) -> dict[str, Any]:
 
 def _cmd_codex_goal_status(args: argparse.Namespace, status: str) -> dict[str, Any]:
     alias_root = Path(args.alias_root).expanduser()
-    alias = _require_alias(args.lane_id, alias_root)
+    alias = _require_command_alias(args, alias_root)
     thread_id = str(alias["codex_thread_id"])
     with _codex_for_alias(alias) as codex:
         result = codex.set_goal(thread_id, status=status)
@@ -2797,11 +3722,25 @@ def _runner_state(
     alias: dict[str, Any],
     goal: dict[str, Any] | None = None,
     *,
-    thread_active: bool = False,
+    thread: dict[str, Any] | None = None,
+    thread_active: bool | None = None,
+    thread_observed: bool | None = None,
+    observed_turn: dict[str, Any] | None = None,
+    goal_source: str | None = None,
 ) -> dict[str, Any]:
+    if thread is not None:
+        thread_observed = True
+        thread_active = _thread_has_active_turn(thread)
+    elif thread_observed is None:
+        thread_observed = thread_active is not None
+
     pid = alias.get("runner_pid")
     runner_alive = process_running(pid)
-    last_status = str(alias.get("last_status") or "idle")
+    if pid is None and isinstance(alias.get("owner_running"), bool):
+        runner_alive = bool(alias.get("owner_running"))
+    last_status = str(
+        alias.get("local_runner_status") or alias.get("last_status") or "idle"
+    )
     last_error = str(alias.get("last_error") or "")
     if (
         not runner_alive
@@ -2817,7 +3756,7 @@ def _runner_state(
         )
         last_status = "timed_out"
     elif (
-        not thread_active
+        thread_active is not True
         and pid is not None
         and not runner_alive
         and last_status in {
@@ -2837,17 +3776,22 @@ def _runner_state(
     if goal_status is None:
         goal_status = alias.get("goal_status")
 
-    execution_active = runner_alive or thread_active
-    if runner_alive and thread_active:
+    execution_active = runner_alive or thread_active is True
+    if runner_alive and thread_active is True:
         execution_source = "runner_and_thread"
     elif runner_alive:
         execution_source = "runner"
-    elif thread_active:
+    elif thread_active is True:
         execution_source = "thread"
     else:
-        execution_source = "none"
+        execution_source = "none" if thread_observed else "unknown"
 
+    alias_proves_inactive = last_status in STOPPED_RUNNER_STATUSES or (
+        "last_status" in alias and last_status == "idle"
+    )
     if execution_active:
+        needs_resume = False
+    elif not thread_observed and not alias_proves_inactive:
         needs_resume = False
     elif goal_status == "active":
         needs_resume = True
@@ -2858,21 +3802,275 @@ def _runner_state(
 
     alias["runner_alive"] = runner_alive
     alias["needs_resume"] = needs_resume
-    effective_status = "inProgress" if thread_active else last_status
+    raw_last_turn = _observed_last_turn(thread, alias, observed_turn)
+    canonical_last_turn = _canonical_last_turn(
+        alias,
+        active=execution_active,
+        thread=thread,
+        observed_turn=observed_turn,
+        raw_last_turn=raw_last_turn,
+        execution_source=execution_source,
+    )
+    if (
+        not execution_active
+        and thread_observed
+        and str(canonical_last_turn.get("status") or "").casefold()
+        in {"active", "inprogress", "in_progress", "running", "started", "starting"}
+    ):
+        canonical_last_turn = {
+            **canonical_last_turn,
+            "status": None,
+            "source": "thread_inactive",
+        }
+    if execution_active:
+        state = "active"
+    elif thread_observed or _is_terminal_turn_status(
+        canonical_last_turn.get("status")
+    ) or last_status in STOPPED_RUNNER_STATUSES:
+        state = "inactive"
+    elif "last_status" in alias and last_status == "idle":
+        state = "inactive"
+    else:
+        state = "unknown"
+    if execution_active:
+        effective_status = "inProgress"
+    elif last_status in {"stale", "timed_out"}:
+        effective_status = last_status
+    else:
+        effective_status = str(
+            canonical_last_turn.get("status") or last_status or "unknown"
+        )
+    conflicts = _execution_conflicts(
+        active=execution_active,
+        thread_active=thread_active,
+        thread_observed=bool(thread_observed),
+        runner_alive=runner_alive,
+        local_status=last_status,
+        raw_last_turn=raw_last_turn,
+        goal_status=goal_status,
+    )
+    if execution_active:
+        decision_source = execution_source
+    elif isinstance(observed_turn, dict):
+        decision_source = "turn_result"
+    elif thread_observed:
+        decision_source = "thread"
+    elif "last_status" in alias:
+        decision_source = "alias"
+    else:
+        decision_source = "unknown"
+    execution = {
+        "state": state,
+        "active": execution_active if state != "unknown" else None,
+        "effective_turn_status": effective_status,
+        "source": decision_source,
+        "needs_resume": needs_resume,
+        "evidence": {
+            "thread": {
+                "observed": bool(thread_observed),
+                "status": _thread_status_type(thread),
+                "active": thread_active if thread_observed else None,
+                "active_turn_id": canonical_last_turn.get("turn_id")
+                if thread_active is True
+                else None,
+            },
+            "runner": {
+                "pid": int(pid) if runner_alive and pid is not None else None,
+                "alive": runner_alive,
+                "status": last_status,
+            },
+            "last_turn": raw_last_turn,
+            "goal": {
+                "status": goal_status,
+                "source": goal_source
+                or ("thread_goal_get" if isinstance(goal, dict) else "alias"),
+            },
+        },
+        "conflicts": conflicts,
+    }
     return {
         "status": effective_status,
         "local_status": last_status,
         "alive": runner_alive,
         "thread_active": thread_active,
-        "execution_active": execution_active,
+        "execution_active": execution["active"],
         "execution_source": execution_source,
         "needs_resume": needs_resume,
         "pid": int(pid) if runner_alive and pid is not None else None,
+        "last_turn": canonical_last_turn,
+        "execution": execution,
+    }
+
+
+def _thread_status_type(thread: dict[str, Any] | None) -> str | None:
+    if not isinstance(thread, dict):
+        return None
+    status = thread.get("status")
+    if isinstance(status, dict):
+        value = status.get("type")
+    else:
+        value = status
+    text = str(value or "").strip()
+    return text or None
+
+
+def _observed_last_turn(
+    thread: dict[str, Any] | None,
+    alias: dict[str, Any],
+    observed_turn: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(observed_turn, dict):
+        return _turn_result_summary(observed_turn, source="turn_result")
+    if isinstance(thread, dict) and isinstance(thread.get("turns"), list):
+        summary = _last_turn_summary(thread)
+        if summary.get("turn_id") is not None:
+            return {**summary, "source": "app_server"}
+    if alias.get("last_turn_id") is not None or alias.get("last_status") is not None:
+        return {
+            "turn_id": alias.get("last_turn_id") or alias.get("current_turn_id"),
+            "status": alias.get("last_status"),
+            "started_at": alias.get("pending_turn_started_at"),
+            "completed_at": None,
+            "user_request": None,
+            "assistant_final_lead": _last_completed_final_lead(alias),
+            "assistant_final_excerpt": _clip(alias.get("last_final_text"), 800),
+            "source": "alias",
+        }
+    return {**_empty_last_turn(), "source": "unavailable"}
+
+
+def _canonical_last_turn(
+    alias: dict[str, Any],
+    *,
+    active: bool,
+    thread: dict[str, Any] | None,
+    observed_turn: dict[str, Any] | None,
+    raw_last_turn: dict[str, Any],
+    execution_source: str,
+) -> dict[str, Any]:
+    if active:
+        active_summary = _active_turn_summary(thread or {})
+        if isinstance(active_summary, dict):
+            return {
+                "turn_id": active_summary.get("turn_id"),
+                "status": "inProgress",
+                "started_at": active_summary.get("started_at"),
+                "completed_at": None,
+                "user_request": active_summary.get("user_request"),
+                "assistant_final_lead": None,
+                "assistant_final_excerpt": None,
+                "source": active_summary.get("source") or "app_server",
+            }
+        return {
+            "turn_id": alias.get("current_turn_id")
+            or alias.get("last_turn_id")
+            or raw_last_turn.get("turn_id"),
+            "status": "inProgress",
+            "started_at": alias.get("pending_turn_started_at"),
+            "completed_at": None,
+            "user_request": None,
+            "assistant_final_lead": None,
+            "assistant_final_excerpt": None,
+            "source": (
+                "thread_status" if execution_source == "thread" else execution_source
+            ),
+        }
+    if isinstance(observed_turn, dict):
+        return _turn_result_summary(observed_turn, source="turn_result")
+    return dict(raw_last_turn)
+
+
+def _turn_result_summary(turn: dict[str, Any], *, source: str) -> dict[str, Any]:
+    final_text = _clean_agent_text(str(turn.get("final_text") or ""))
+    return {
+        "turn_id": turn.get("turn_id") or turn.get("id"),
+        "status": turn.get("status"),
+        "started_at": turn.get("started_at"),
+        "completed_at": turn.get("completed_at"),
+        "user_request": None,
+        "assistant_final_lead": _clip(_first_paragraph(final_text), 160),
+        "assistant_final_excerpt": _clip(final_text, 800),
+        "source": source,
+    }
+
+
+def _execution_conflicts(
+    *,
+    active: bool,
+    thread_active: bool | None,
+    thread_observed: bool,
+    runner_alive: bool,
+    local_status: str,
+    raw_last_turn: dict[str, Any],
+    goal_status: Any,
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    if active and goal_status in {
+        "blocked",
+        "budgetLimited",
+        "cancelled",
+        "complete",
+        "completed",
+        "failed",
+        "paused",
+        "usageLimited",
+    }:
+        conflicts.append(
+            {
+                "code": "EXECUTION_ACTIVE_GOAL_STOPPED",
+                "fields": ["execution.active", "goal_status"],
+            }
+        )
+    if active and local_status not in {
+        "active",
+        "inProgress",
+        "in_progress",
+        "running",
+        "started",
+        "starting",
+    }:
+        conflicts.append(
+            {
+                "code": "EXECUTION_ACTIVE_LOCAL_STATUS_STALE",
+                "fields": ["execution.active", "local_runner_status"],
+            }
+        )
+    if thread_active is True and _is_terminal_turn_status(
+        raw_last_turn.get("status")
+    ):
+        conflicts.append(
+            {
+                "code": "THREAD_ACTIVE_LAST_TURN_TERMINAL",
+                "fields": ["thread_active", "execution.evidence.last_turn.status"],
+            }
+        )
+    if runner_alive and thread_observed and thread_active is False:
+        conflicts.append(
+            {
+                "code": "RUNNER_ACTIVE_THREAD_INACTIVE",
+                "fields": ["runner_alive", "thread_active"],
+            }
+        )
+    return conflicts
+
+
+def _execution_fields(runner: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "runner_status": runner["status"],
+        "local_runner_status": runner["local_status"],
+        "runner_alive": runner["alive"],
+        "thread_active": runner["thread_active"],
+        "execution_active": runner["execution_active"],
+        "execution_source": runner["execution_source"],
+        "needs_resume": runner["needs_resume"],
+        "last_turn": runner["last_turn"],
+        "execution": runner["execution"],
     }
 
 
 def _turn_timeout_result(
     *,
+    codex: CodexAppServer,
     alias: dict[str, Any],
     alias_root: Path,
     lane_id: str,
@@ -2880,11 +4078,31 @@ def _turn_timeout_result(
     cwd: str | None,
     error: str,
 ) -> dict[str, Any]:
-    stored_goal = alias.get("goal")
-    goal = stored_goal if isinstance(stored_goal, dict) else None
-    runner = _runner_state(alias, goal)
+    thread: dict[str, Any] | None = None
+    observation_error: str | None = None
+    try:
+        thread = codex.read_thread(thread_id, include_turns=True).get("thread") or {}
+    except Exception as exc:
+        observation_error = str(exc)
+    try:
+        observed_goal = codex.get_goal(thread_id)
+    except Exception:
+        stored_goal = alias.get("goal")
+        goal = stored_goal if isinstance(stored_goal, dict) else None
+        goal_source = "alias"
+    else:
+        goal = observed_goal if isinstance(observed_goal, dict) else None
+        goal_source = "thread_goal_get"
+    runner = _runner_state(
+        alias,
+        goal,
+        thread=thread if observation_error is None else None,
+        thread_observed=observation_error is None,
+        goal_source=goal_source,
+    )
     path = save_alias(CODEX_PROVIDER, lane_id, alias, alias_root)
-    return {
+    active = runner["execution_active"]
+    result = {
         "ok": False,
         "provider": "codex",
         "lane_id": lane_id,
@@ -2895,12 +4113,16 @@ def _turn_timeout_result(
         "status": "timed_out",
         **_turn_request_echo(alias),
         "goal_status": goal.get("status") if goal else alias.get("goal_status"),
-        "runner_alive": runner["alive"],
-        "needs_resume": runner["needs_resume"],
-        "retryable": True,
+        "goal_status_source": goal_source,
+        **_execution_fields(runner),
+        "recommended_action": "observe" if active is not False else "resume",
+        "retryable": active is False,
         "error_code": "TURN_TIMEOUT",
         "error": error,
     }
+    if observation_error is not None:
+        result["execution_observation_error"] = observation_error
+    return result
 
 
 def _run_tracked_turn(
@@ -3008,6 +4230,69 @@ def _run_tracked_turn(
                 error=str(exc),
                 error_code=exc.error_code,
             )
+            if exc.error_code == "CODEX_DAEMON_TURN_STATE_UNCERTAIN":
+                observed_thread: dict[str, Any] | None = None
+                observation_error: str | None = None
+                try:
+                    observed_thread = (
+                        codex.read_thread(thread_id, include_turns=True).get(
+                            "thread"
+                        )
+                        or {}
+                    )
+                except Exception as observation_exc:
+                    observation_error = str(observation_exc)
+                try:
+                    observed_goal = codex.get_goal(thread_id)
+                except Exception:
+                    stored_goal = alias.get("goal")
+                    goal = (
+                        stored_goal
+                        if isinstance(stored_goal, dict)
+                        else None
+                    )
+                    goal_source = "alias"
+                else:
+                    goal = (
+                        observed_goal
+                        if isinstance(observed_goal, dict)
+                        else None
+                    )
+                    goal_source = "thread_goal_get"
+                runner = _runner_state(
+                    alias,
+                    goal,
+                    thread=(
+                        observed_thread
+                        if observation_error is None
+                        else None
+                    ),
+                    thread_observed=observation_error is None,
+                    goal_source=goal_source,
+                )
+                active = runner["execution_active"]
+                exc.retryable = active is False
+                exc.details.update(
+                    {
+                        "lane_id": lane_id,
+                        "codex_thread_id": thread_id,
+                        **_turn_request_echo(alias),
+                        "goal_status": (
+                            goal.get("status")
+                            if goal
+                            else alias.get("goal_status")
+                        ),
+                        "goal_status_source": goal_source,
+                        **_execution_fields(runner),
+                        "recommended_action": (
+                            "observe" if active is not False else "resume"
+                        ),
+                    }
+                )
+                if observation_error is not None:
+                    exc.details["execution_observation_error"] = (
+                        observation_error
+                    )
         else:
             _mark_runner_stopped(
                 alias,
@@ -3045,13 +4330,28 @@ def _resolve_turn_request(
         model_source = "default-or-unset"
 
     raw_effort = getattr(args, "effort", None)
-    effort = _validated_effort(raw_effort)
-    effort_source = "explicit" if raw_effort is not None else "default-or-unset"
+    if raw_effort is not None:
+        effort = _validated_effort(raw_effort)
+        effort_source = "explicit"
+    else:
+        try:
+            configured = read_default_effort()
+        except UserConfigError as exc:
+            raise WorkspaceError(
+                "USER_CONFIG_INVALID",
+                str(exc),
+                config_path=str(user_config_path()),
+                retryable=False,
+            ) from exc
+        effort = configured["value"]
+        effort_source = str(configured["source"])
     return {
         "requested_model": model,
         "requested_model_source": model_source,
         "requested_effort": effort,
         "requested_effort_source": effort_source,
+        "effective_effort": effort,
+        "effective_effort_source": effort_source,
     }
 
 
@@ -3062,6 +4362,8 @@ def _turn_request_echo(alias: dict[str, Any] | None) -> dict[str, Any]:
             "requested_model_source": "unknown",
             "requested_effort": None,
             "requested_effort_source": "unknown",
+            "effective_effort": None,
+            "effective_effort_source": "unknown",
         }
 
     model = (
@@ -3072,7 +4374,24 @@ def _turn_request_echo(alias: dict[str, Any] | None) -> dict[str, Any]:
     model_source = alias.get("requested_model_source")
     effort = alias.get("requested_effort")
     effort_source = alias.get("requested_effort_source")
-    known_sources = {"explicit", "alias", "default-or-unset", "unknown"}
+    effective_effort = alias.get("effective_effort", effort)
+    effective_effort_source = alias.get("effective_effort_source")
+    if not isinstance(effective_effort_source, str):
+        if effort_source in {"explicit", "user_config", "user_config_legacy"}:
+            effective_effort_source = effort_source
+        elif effort_source == "default-or-unset" and effort is None:
+            effective_effort_source = "unset"
+        else:
+            effective_effort_source = "unknown"
+    known_sources = {
+        "explicit",
+        "alias",
+        "default-or-unset",
+        "unset",
+        "user_config",
+        "user_config_legacy",
+        "unknown",
+    }
     return {
         "requested_model": model,
         "requested_model_source": (
@@ -3084,6 +4403,12 @@ def _turn_request_echo(alias: dict[str, Any] | None) -> dict[str, Any]:
         "requested_effort_source": (
             effort_source
             if isinstance(effort_source, str) and effort_source in known_sources
+            else "unknown"
+        ),
+        "effective_effort": effective_effort,
+        "effective_effort_source": (
+            effective_effort_source
+            if effective_effort_source in known_sources
             else "unknown"
         ),
     }
@@ -3242,7 +4567,7 @@ def _validated_config_overrides(values: list[str] | None) -> list[str]:
         if "=" not in value:
             raise ValueError("--config requires KEY=VALUE")
         key = value.split("=", 1)[0].strip().casefold()
-        if any(part in key for part in SENSITIVE_CONFIG_KEY_PARTS):
+        if _is_sensitive_config_key(key):
             raise ValueError(
                 f"refusing potentially sensitive --config key {key!r}; "
                 "use Codex config or environment-based credential storage"
@@ -3251,13 +4576,27 @@ def _validated_config_overrides(values: list[str] | None) -> list[str]:
     return overrides
 
 
+def _is_sensitive_config_key(key: str) -> bool:
+    segments = [
+        segment.replace("-", "_")
+        for segment in key.replace("[", ".").replace("]", ".").split(".")
+        if segment
+    ]
+    sensitive_suffixes = tuple(f"_{part}" for part in SENSITIVE_CONFIG_KEY_PARTS)
+    return any(
+        segment in SENSITIVE_CONFIG_KEY_PARTS
+        or segment.endswith(sensitive_suffixes)
+        for segment in segments
+    )
+
+
 def _validated_effort(effort: str | None) -> str | None:
     if effort is None:
         return None
-    level = str(effort).strip()
-    if not level:
-        raise ValueError("--effort requires a non-empty value")
-    return level
+    try:
+        return normalize_effort(effort, label="--effort")
+    except UserConfigError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _resolve_add_dirs(
@@ -3302,16 +4641,26 @@ def _wait_for_lane(
     timeout: float,
     poll_interval: float,
     emit: Any = None,
+    expected_thread_id: str | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + max(timeout, 0.0)
     started_at = time.monotonic()
     polls = 0
     last_signature: str | None = None
     latest: dict[str, Any] | None = None
-    alias = _require_alias(lane_id, alias_root)
+    alias = _require_alias_identity(
+        lane_id,
+        alias_root,
+        expected_thread_id=expected_thread_id,
+    )
     with _codex_for_alias(alias) as codex:
         while True:
-            latest = _lane_observation(codex, lane_id, alias_root)
+            latest = _lane_observation(
+                codex,
+                lane_id,
+                alias_root,
+                expected_thread_id=expected_thread_id,
+            )
             polls += 1
             signature = json.dumps(
                 {
@@ -3345,12 +4694,126 @@ def _wait_for_lane(
             time.sleep(max(poll_interval, 0.05))
 
 
+def _wait_for_thread(
+    *,
+    thread_id: str,
+    timeout: float,
+    poll_interval: float,
+    alias_root: Path,
+    emit: Any = None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(timeout, 0.0)
+    started_at = time.monotonic()
+    polls = 0
+    last_signature: str | None = None
+    codex, transport = _open_read_only_codex("auto")
+    with codex:
+        while True:
+            latest = _thread_observation(
+                codex,
+                thread_id,
+                alias_root=alias_root,
+            )
+            latest.update(transport)
+            polls += 1
+            signature = json.dumps(
+                {
+                    "turn_id": latest.get("turn_id"),
+                    "status": latest.get("status"),
+                    "final_lead": latest.get("final_lead"),
+                    "error": latest.get("observation_error"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if emit and signature != last_signature and not latest["terminal"]:
+                emit(latest)
+            last_signature = signature
+            if latest["terminal"]:
+                return {
+                    "ok": latest["status"] == "completed",
+                    **latest,
+                    "polls": polls,
+                    "waited_seconds": round(time.monotonic() - started_at, 3),
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "ok": False,
+                    **latest,
+                    "error_code": "THREAD_WAIT_TIMEOUT",
+                    "error": f"thread wait timed out after {timeout}s",
+                    "polls": polls,
+                    "waited_seconds": round(time.monotonic() - started_at, 3),
+                }
+            time.sleep(max(poll_interval, 0.05))
+
+
+def _thread_observation(
+    codex: CodexAppServer,
+    thread_id: str,
+    *,
+    alias_root: Path,
+) -> dict[str, Any]:
+    thread: dict[str, Any] = {}
+    observation_error: str | None = None
+    try:
+        thread = codex.read_thread(thread_id, include_turns=True).get("thread") or {}
+    except Exception as exc:
+        observation_error = str(exc)
+    runner = _runner_state(
+        {"codex_thread_id": thread_id},
+        thread=thread if observation_error is None else None,
+        thread_observed=observation_error is None,
+    )
+    turn = runner["last_turn"]
+    status = str(runner["status"] or "unknown")
+    terminal = (
+        runner["execution"]["state"] == "inactive"
+        and _is_stopped_runner_status(status)
+    )
+    result: dict[str, Any] = {
+        "lane_id": None,
+        "codex_thread_id": thread_id,
+        "codex_url": f"codex://threads/{thread_id}",
+        "turn_id": turn.get("turn_id"),
+        "status": status,
+        "terminal": terminal,
+        **_execution_fields(runner),
+        "last_user": turn.get("user_request"),
+        "final_lead": turn.get("assistant_final_lead"),
+        "final_text": turn.get("assistant_final_excerpt"),
+        "observation_mode": "thread_read_poll",
+        "confidence": "high" if observation_error is None else "low",
+        "limitation": OBSERVATION_LIMITATION,
+        "control": _control_contract(
+            None,
+            thread_id,
+            thread=thread,
+            attach_mode=(
+                "app-sync"
+                if getattr(codex, "transport", "stdio") == "daemon"
+                else "independent"
+            ),
+            alias_root=alias_root,
+        ),
+    }
+    if observation_error is not None:
+        result["observation_error"] = observation_error
+    return result
+
+
 def _lane_observation(
     codex: CodexAppServer,
     lane_id: str,
     alias_root: Path,
+    *,
+    expected_thread_id: str | None = None,
 ) -> dict[str, Any]:
-    alias = _require_alias(lane_id, alias_root)
+    alias = _require_alias_identity(
+        lane_id,
+        alias_root,
+        expected_thread_id=expected_thread_id,
+    )
     thread_id = str(alias["codex_thread_id"])
     expected_turn_id = alias.get("current_turn_id")
     if not expected_turn_id and alias.get("last_status") != "starting":
@@ -3363,10 +4826,10 @@ def _lane_observation(
         observation_error = str(exc)
     runner = _runner_state(
         alias,
-        thread_active=_thread_has_active_turn(thread),
+        thread=thread if observation_error is None else None,
+        thread_observed=observation_error is None,
     )
     alias_status = str(runner["status"] or "unknown")
-    owner_running = bool(runner["alive"])
     execution_active = bool(runner["execution_active"])
     turns = [item for item in (thread.get("turns") or []) if isinstance(item, dict)]
     selected: dict[str, Any] | None = None
@@ -3422,13 +4885,7 @@ def _lane_observation(
         "turn_id": turn.get("turn_id") or expected_turn_id,
         "status": status,
         "terminal": terminal,
-        "runner_status": runner["status"],
-        "local_runner_status": runner["local_status"],
-        "runner_alive": owner_running,
-        "thread_active": runner["thread_active"],
-        "execution_active": execution_active,
-        "execution_source": runner["execution_source"],
-        "needs_resume": runner["needs_resume"],
+        **_execution_fields(runner),
         "last_user": turn.get("user_request"),
         "final_lead": final_lead,
         "final_text": final_text,
@@ -3561,6 +5018,7 @@ def _resolve_execution_mode(
     alias: dict[str, Any] | None,
     *,
     source_when_defaulted: str = "default",
+    allow_rebind: bool = False,
 ) -> tuple[str, str]:
     explicit = _nonempty_text(requested)
     if explicit is not None and explicit not in EXECUTION_MODES:
@@ -3571,14 +5029,24 @@ def _resolve_execution_mode(
             choices=list(EXECUTION_MODES),
             retryable=False,
         )
-    stored = _stored_execution_mode(alias)
+    try:
+        stored = _stored_execution_mode(alias)
+    except WorkspaceError:
+        if explicit is not None and allow_rebind:
+            return explicit, "explicit"
+        raise
     if explicit is not None and stored is not None and explicit != stored:
+        if allow_rebind:
+            return explicit, "explicit"
         raise WorkspaceError(
             "LANE_EXECUTION_MODE_CONFLICT",
             "a lane execution mode cannot be changed in place",
             requested_mode=explicit,
             stored_mode=stored,
-            recovery="create or attach a different lane with the requested mode",
+            recovery=(
+                "re-attach the same task with codex session attach and the "
+                "requested --mode"
+            ),
             retryable=False,
         )
     if explicit is not None:
@@ -4209,8 +5677,64 @@ def _prepare_existing_thread_for_turn(
 def _require_alias(lane_id: str, alias_root: Path) -> dict[str, Any]:
     alias = load_alias(CODEX_PROVIDER, lane_id, alias_root)
     if not alias or not alias.get("codex_thread_id"):
-        raise ValueError(f"no codex thread found for lane-id {lane_id!r}")
+        raise WorkspaceError(
+            "LANE_ALIAS_NOT_FOUND",
+            "lane-id is not attached to a Codex task",
+            lane_id=lane_id,
+            control_requires_explicit_attach=True,
+            recovery={
+                "discover_argv": ["codex", "session", "list", "--scope", "all"],
+                "attach_argv": [
+                    "codex",
+                    "session",
+                    "attach",
+                    "--lane-id",
+                    lane_id,
+                    "--thread-id",
+                    "<thread-id>",
+                    "--mode",
+                    "independent",
+                ],
+            },
+            retryable=False,
+        )
     return alias
+
+
+def _require_alias_identity(
+    lane_id: str,
+    alias_root: Path,
+    *,
+    expected_thread_id: str | None,
+) -> dict[str, Any]:
+    alias = _require_alias(lane_id, alias_root)
+    observed_thread_id = _nonempty_text(alias.get("codex_thread_id"))
+    if (
+        expected_thread_id is not None
+        and observed_thread_id != expected_thread_id
+    ):
+        raise WorkspaceError(
+            "CODEX_TARGET_CHANGED",
+            "the resolved task binding changed before the command began",
+            lane_id=lane_id,
+            expected_thread_id=expected_thread_id,
+            observed_thread_id=observed_thread_id,
+            retryable=False,
+        )
+    return alias
+
+
+def _require_command_alias(
+    args: argparse.Namespace,
+    alias_root: Path,
+) -> dict[str, Any]:
+    return _require_alias_identity(
+        str(args.lane_id),
+        alias_root,
+        expected_thread_id=_nonempty_text(
+            getattr(args, "_target_expected_thread_id", None)
+        ),
+    )
 
 
 def _nonempty_text(value: Any) -> str | None:
@@ -4580,7 +6104,14 @@ def _refresh_aliases_from_codex(
     return refreshed
 
 
-def _alias_summary(item: dict[str, Any]) -> dict[str, Any]:
+def _alias_summary(
+    item: dict[str, Any],
+    *,
+    alias_root: Path,
+) -> dict[str, Any]:
+    stored_goal = item.get("goal")
+    goal = stored_goal if isinstance(stored_goal, dict) else None
+    runner = _runner_state(dict(item), goal)
     return {
         "kind": "lane_alias",
         "aliased": True,
@@ -4598,14 +6129,18 @@ def _alias_summary(item: dict[str, Any]) -> dict[str, Any]:
         "commit_signing": item.get("commit_signing"),
         "workspace": workspace_snapshot(item.get("cwd"), item.get("workspace")),
         "last_status": item.get("last_status"),
-        "runner_alive": item.get("runner_alive"),
-        "needs_resume": item.get("needs_resume"),
+        **_execution_fields(runner),
         "goal_status": item.get("goal_status"),
         "objective": item.get("objective"),
         "updated_at": item.get("updated_at"),
         "codex_recency_at": item.get("codex_recency_at"),
         "refresh_error": item.get("refresh_error"),
         "last_final_text": _clip(item.get("last_final_text"), 500),
+        "control": _control_contract(
+            item,
+            str(item.get("codex_thread_id") or ""),
+            alias_root=alias_root,
+        ),
     }
 
 
@@ -5341,39 +6876,15 @@ def _apply_session_execution_state(
 ) -> dict[str, Any]:
     enriched = dict(item)
     observed_thread = thread or {"status": enriched.get("status")}
-    thread_active = _thread_has_active_turn(observed_thread)
-    runner_alive = bool(enriched.get("owner_running"))
-    execution_active = runner_alive or thread_active
-    if runner_alive and thread_active:
-        execution_source = "runner_and_thread"
-    elif runner_alive:
-        execution_source = "runner"
-    elif thread_active:
-        execution_source = "thread"
-    else:
-        execution_source = "none"
-    local_status = enriched.get("local_runner_status") or enriched.get("last_status")
-    runner_status = "inProgress" if thread_active else local_status
     goal_status = enriched.get("goal_status")
-    if execution_active:
-        needs_resume = False
-    elif goal_status == "active":
-        needs_resume = True
-    elif goal_status is not None:
-        needs_resume = False
-    else:
-        needs_resume = bool(enriched.get("needs_resume"))
-    enriched.update(
-        {
-            "runner_status": runner_status,
-            "local_runner_status": local_status,
-            "runner_alive": runner_alive,
-            "thread_active": thread_active,
-            "execution_active": execution_active,
-            "execution_source": execution_source,
-            "needs_resume": needs_resume,
-        }
+    goal = {"status": goal_status} if goal_status is not None else None
+    runner = _runner_state(
+        enriched,
+        goal,
+        thread=observed_thread,
+        goal_source=str(enriched.get("goal_status_source") or "unavailable"),
     )
+    enriched.update(_execution_fields(runner))
     return enriched
 
 
@@ -5917,6 +7428,7 @@ def _thread_summary(
         "thread_recency_at": thread_recency,
         "recency_at": thread_recency,
         "codex_url": f"codex://threads/{thread_id}",
+        "control": _control_contract(alias, thread_id, thread=item),
         **_turn_request_echo(alias),
         "_session_path": item.get("path")
         or (alias.get("codex_session_path") if alias else None),

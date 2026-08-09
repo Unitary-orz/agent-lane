@@ -122,6 +122,7 @@ def test_steer_lane_targets_live_turn_without_mutating_alias(
     result = decode_cli_output(capsys.readouterr().out)
 
     assert rc == 0
+    target_resolution = result.pop("target_resolution")
     assert result == {
         "app_server_transport": "daemon",
         "client_user_message_id": "agent-lane-steer-client",
@@ -148,17 +149,34 @@ def test_steer_lane_targets_live_turn_without_mutating_alias(
         }
     ]
     assert alias_path.read_bytes() == before
+    assert target_resolution["source"] == "explicit_lane_id"
 
 
-def test_steer_rejects_removed_direct_thread_target(capsys):
+def test_steer_requires_explicit_attach_for_unbound_thread(capsys):
     rc = main(
         ["codex", "steer", "--thread-id", "thread-app", "--prompt", "Continue."]
     )
     result = decode_cli_output(capsys.readouterr().out)
 
-    assert rc == 2
-    assert result["error_code"] == "CLI_REMOVED"
-    assert result["replacement"] == "codex session attach"
+    assert rc == 1
+    assert result["error_code"] == "CODEX_TARGET_ATTACH_REQUIRED"
+    assert result["attach_argv"] == [
+        "codex",
+        "session",
+        "attach",
+        "--thread-id",
+        "thread-app",
+        "--mode",
+        "app-sync",
+    ]
+    assert result["after_attach_argv"] == [
+        "codex",
+        "steer",
+        "--thread-id",
+        "thread-app",
+        "--prompt",
+        "Continue.",
+    ]
 
 
 def test_steer_optional_turn_id_is_a_strict_precondition(
@@ -465,6 +483,43 @@ def test_steer_rechecks_turn_after_waiting_for_thread_lock(tmp_path, monkeypatch
     assert caught.value.error_code == "CODEX_STEER_TURN_CHANGED"
     assert caught.value.details["expected_turn_id"] == "turn-live"
     assert caught.value.details["active_turn_id"] == "turn-next"
+    assert FakeSteerCodex.steer_calls == []
+
+
+def test_steer_rechecks_thread_binding_after_waiting_for_thread_lock(
+    tmp_path, monkeypatch
+):
+    aliases = tmp_path / "aliases"
+    _save_lane(aliases)
+    monkeypatch.setattr(cli, "CodexAppServer", FakeSteerCodex)
+    args = build_parser().parse_args(
+        [
+            "codex",
+            "steer",
+            "--thread-id",
+            "thread-1",
+            "--alias-root",
+            str(aliases),
+            "--prompt",
+            "must retain attached control",
+            "--timeout",
+            "2",
+        ]
+    )
+    cli._prepare_command_target(args)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with operation_lock(cli.STEER_LOCK_ROOT, "thread-1", namespace="steer"):
+            future = pool.submit(cli.cmd_codex_steer, args)
+            assert FakeSteerCodex.initial_read.wait(timeout=1)
+            _save_lane(aliases, thread_id="thread-2")
+        with pytest.raises(WorkspaceError) as caught:
+            future.result(timeout=2)
+
+    assert caught.value.error_code == "CODEX_STEER_TARGET_CHANGED"
+    assert caught.value.details["expected_thread_id"] == "thread-1"
+    assert caught.value.details["observed_thread_id"] == "thread-1"
+    assert caught.value.details["observed_lane_id"] is None
     assert FakeSteerCodex.steer_calls == []
 
 

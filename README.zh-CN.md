@@ -8,7 +8,7 @@ V1 首先支持 Codex coding agent。
 
 [English](README.md) · [架构说明](docs/architecture.md) · [变更记录](CHANGELOG.md)
 
-> 当前版本：`1.0.0-rc.1`。Python 打包工具可能显示等价版本 `1.0.0rc1`。
+> 当前版本：`1.0.0-rc.2`。Python 打包工具可能显示等价版本 `1.0.0rc2`。
 
 ## 看一段真实的使用过程
 
@@ -30,7 +30,7 @@ V1 首先支持 Codex coding agent。
 ```bash
 agent-lane codex session list --scope all --limit 10
 agent-lane codex send \
-  --lane-id settings-page \
+  --thread-id "<第-2-项的-thread-id>" \
   --prompt "落地已经确认的设置页改造，并运行相关测试。"
 ```
 
@@ -41,28 +41,41 @@ agent-lane codex send \
 
 ### “开始落地新的登录流程”
 
-助手创建一个有名字的 lane，再把任务交给 Codex：
+助手创建一个有名字的 task，再把任务交给 Codex；正常创建路径不需要 lane ID：
 
 ```bash
 agent-lane codex run \
-  --lane-id login-flow \
+  --title login-flow \
   --cwd /path/to/project \
   --commit-signing off \
   --prompt "落地新的登录流程，并运行相关测试。"
 ```
 
-`login-flow` 会成为这条 coding 会话的长期名称。今天暂停后，助手明天仍能回到这里，
-不需要再向 Human 索要 Codex task ID。
+agent-lane 会生成并保存内部稳定 lane ID，`login-flow` 是面向 Human 的标题。今天
+暂停后，发现结果会给出继续该会话所需的精确 thread 目标；Human 不需要创建或记住
+lane ID。
+
+如果希望固定用户级 reasoning effort，只需配置一次 agent-lane：
+
+```bash
+agent-lane config effort set xh
+agent-lane config effort status
+```
+
+`xh` 会归一化为 `xhigh`。之后的 `run`、`send` 和 `goal run` 默认使用该值；
+命令显式传入的 `--effort` 始终优先。JSON 会报告 `effective_effort` 和
+`effective_effort_source`。配置保存在 `~/.agent-lane/config.json`，不会修改
+Codex 自身配置。
 
 ### “登录流程这个会话做了什么？”
 
 助手可以查看会话，而不发起新一轮编码：
 
 ```bash
-agent-lane codex status --lane-id login-flow
-agent-lane codex session outline --lane-id login-flow
-agent-lane codex session read --lane-id login-flow --include-turns
-agent-lane codex closeout --lane-id login-flow
+agent-lane codex status --thread-id "<选定的-thread-id>"
+agent-lane codex session outline --thread-id "<选定的-thread-id>"
+agent-lane codex session read --thread-id "<选定的-thread-id>" --include-turns
+agent-lane codex closeout --thread-id "<选定的-thread-id>"
 ```
 
 助手可以据此回答实际问题：
@@ -73,18 +86,39 @@ agent-lane codex closeout --lane-id login-flow
 
 单纯查看会话不会暗中启动新的工作。
 
+带状态的结果统一以 `execution` 作为判定对象。`execution.state` 只取
+`active`、`inactive` 或 `unknown`；`execution.evidence` 分别记录 thread、
+本地 runner、last turn 和 Goal 证据，`execution.conflicts` 保留冲突。活跃
+thread 或存活 runner 的正向证据优先于缓存的终态字段和 Goal 生命周期状态。
+`runner_status` 表示有效 turn 状态，`local_runner_status` 只表示本地
+runner/缓存状态。因此 Goal 已 blocked 或 complete 时，也不能把实际仍在运行的
+turn 判为 inactive。
+
 ### “继续这个会话，把测试补完”
 
 助手把后续要求发给原来的 lane：
 
 ```bash
 agent-lane codex send \
-  --lane-id login-flow \
+  --thread-id "<选定的-thread-id>" \
   --prompt "修复剩余测试失败，并重新运行相关测试。"
 ```
 
 Codex 会沿用同一段对话和工作目录上下文。`run` 本身也采用“没有就创建、已有就恢复”
-的行为，因此助手可以在固定流程中反复使用同一个 lane。
+的行为。已有 lane ID 的自动化仍可传 `--lane-id`；正常交互可直接使用选定 thread。
+
+### Task 目标与 fail-closed 选择
+
+针对单个 task 的命令接受四种互斥目标之一：`--thread-id` 表示发现结果中的精确
+session，`--target-title` 表示已绑定 task 的精确已知标题，`--current` 表示保存的
+工作目录与当前进程目录相同的唯一已绑定 task，`--lane-id` 则保留给兼容自动化。
+`run` 和 `goal set` 可以完全省略目标，此时创建新 task 并生成内部 lane ID。
+
+标题匹配不区分大小写但必须完整相等；`--current` 不表示“最近一个”。标题或当前
+目录命中多个候选时，命令以 `CODEX_TARGET_AMBIGUOUS` 失败，并返回
+`choices[].target_argv`，绝不猜测。成功结果在 `target_resolution` 中报告请求与
+解析后的身份；选择完成到控制开始之间若绑定变化，则以 `CODEX_TARGET_CHANGED`
+失败。
 
 ## Codex 支持
 
@@ -113,11 +147,33 @@ Codex 私有数据库，也不自动操作 App UI。
 | --- | --- | --- |
 | `codex session list` | `thread/list` | 使用 stored 或 live 观察列出近期主 task，或包含全部 task thread。 |
 | `codex session find` | `thread/list` 搜索和本地匹配 | 搜索标题、prompt、lane 元数据、工作目录信息和 task 摘要。 |
-| `codex session attach` | `thread/read` | 校验已有 task，再将其绑定到稳定 lane ID 和指定执行模式。 |
+| `codex session attach` | `thread/read` | 校验已有 task，再绑定到内部稳定 lane ID 和指定执行模式；调用方可不提供 lane ID。 |
 | `codex session name get` | `thread/read` | 读取 stored 或 live Codex task 名称。 |
 | `codex session name set` | `thread/name/set`，然后 `thread/read` | 可带冲突检查更新 task 名称，并精确读回确认。 |
 | `codex session outline` | `thread/read` | 返回 task 身份、turn、prompt 和执行状态的紧凑投影。 |
 | `codex session read` | `thread/read` | 读取完整 task、全部 turn，或指定的一个 turn。 |
+
+`session list` 和 `session read` 会返回机器可读的 `control` 对象。尚未绑定的
+task 仍然只能读取，并报告 `requires_explicit_attach: true` 与建议的
+`attach_argv`。stored 观察建议 `independent`，live 观察建议 `app-sync`。只有显式
+attach 后才取得控制权：
+
+```bash
+agent-lane codex session read --thread-id "<task-id>" --include-turns
+agent-lane codex session attach \
+  --thread-id "<task-id>"
+agent-lane codex send \
+  --thread-id "<task-id>" \
+  --prompt "继续处理已经核实的 task。"
+```
+
+attach 缺省使用 `independent`；确实需要 App 共用控制时再显式传
+`--mode app-sync`。首次 attach 未传 lane ID 时会生成内部稳定 ID；同一 thread
+重复 attach 会复用它；显式重复 attach 也可切换该 lane 的执行模式，而不会创建
+第二条绑定。发现和读取都不会创建 lane 绑定。只读的 `status`、`wait`、
+`checkpoint`、`closeout` 和 `goal get` 可直接检查未绑定的精确 thread；控制命令
+则以 `CODEX_TARGET_ATTACH_REQUIRED` 返回分离的 `attach_argv` 与
+`after_attach_argv`，后者保留完整的原控制请求；只读投影不会虚构后续 prompt。
 
 ### Goal 与运行参数
 
@@ -129,10 +185,13 @@ Codex 私有数据库，也不自动操作 App UI。
 | `codex goal complete` | `thread/goal/set` | 将当前 goal 标记为 complete。 |
 | `codex goal clear` | `thread/goal/clear` | 从 Codex task 移除 goal。 |
 | `--sandbox`、`--model`、`--profile`、`--effort`、`--add-dir`、`--config` | app-server 启动参数以及 thread、turn 参数 | 将支持的运行选择和配置传入 Codex 执行链路。 |
+| `config effort set/status/clear` | agent-lane 用户配置 | 管理默认 turn effort，不改写 Codex 配置；显式 `--effort` 优先。 |
 | `codex run --worktree` | Git worktree 和 `runtimeWorkspaceRoots` | 创建隔离工作目录、记录所有权，并绑定到 Codex task。 |
 
 普通命令返回一个结构化 JSON envelope；`codex watch` 输出 JSONL。命令 timeout
 只限制调用方观察 task 的时间，不会重新定义持久化 Codex task 的完成状态。
+timeout 错误也会返回同一份 `execution` 证据；如果 turn 仍在运行或状态未知，
+建议继续观察，而不是重复 `send`。
 
 ### App Sync
 
@@ -143,7 +202,7 @@ App Sync 直接提供以下 Codex App 集成功能：
 | `config app-sync enable` | 在登录后启用 App 与 Agent 共用 task。 | 安装并载入用户级托管运行时，向新打开的 App 进程提供登录环境。 |
 | `config app-sync status` | 报告持久化 App Sync 就绪状态。 | 检查托管运行时、socket、兼容 Codex CLI 和登录配置。 |
 | `doctor --mode app-sync --probe` | 验证端到端共用控制。 | 打开本地 WebSocket，并完成 JSON-RPC `initialize` 探测。 |
-| `codex run --mode app-sync` | 创建或恢复 Agent 与 Codex App 都能访问的 task。 | 使用共用运行时 transport，并将 `app-sync` 持久化为 lane 的固定执行模式。 |
+| `codex run --mode app-sync` | 创建或恢复 Agent 与 Codex App 都能访问的 task。 | 使用共用运行时 transport，并将 `app-sync` 持久化为 lane 的执行模式。 |
 | `codex session list --observe live`、`codex session find --observe live` | 列出或搜索 App 当前可见的 task。 | 通过共用控制面查询 `thread/list`，不使用独立 stdio transport。 |
 | `codex session name get --observe live`、`codex session outline --observe live`、`codex session read --observe live` | 读取 App 当前可见的 task 元数据、消息和 turn 状态。 | 通过共用控制面查询 `thread/read`。 |
 | `codex session attach --mode app-sync` | 将 App 创建的 Codex task 纳入 lane 管理。 | 校验 task，获取 task/lane 锁，再保存 lane 绑定。 |

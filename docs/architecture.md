@@ -22,7 +22,7 @@ runtime, and failures must remain structured and fail closed.
 Commands under `agent-lane codex` create, resume, observe, and close out work:
 
 - `run` is create-or-resume, never create-only.
-- `send` starts a follow-up turn on an existing lane.
+- `send` starts a follow-up turn on an explicitly attached task.
 - `steer` adds input only to one unambiguous active App Sync turn.
 - `status`, `wait`, `watch`, and `checkpoint` observe execution.
 - `closeout` summarizes completion and Git state.
@@ -46,25 +46,57 @@ Top-level commands operate agent-lane itself:
 
 - `doctor` checks readiness for a selected execution mode.
 - `config app-sync` manages optional login activation for the shared runtime.
+- `config effort` manages the user-level default turn effort.
 - `signing` manages the project-owned SSH signing agent.
 
-## Lane identity and task binding
+## Target resolution, lane identity, and task binding
 
-A lane is the stable identifier owned by the caller. A Codex task ID is a
-replaceable binding owned by the provider.
+A lane ID is the stable internal identifier owned by agent-lane. A Codex task
+ID is a replaceable provider binding. Callers can address a task without
+knowing its lane ID.
 
 ```text
-caller -> lane ID -> binding generation -> Codex task ID
+user selection -> target resolver -> internal lane ID -> binding generation -> Codex task ID
 ```
+
+The resolver accepts one explicit selector: exact `thread-id`, exact
+case-insensitive attached title, the unique attached task for the current
+working directory, or a lane ID retained for automation compatibility. It does
+not apply recency heuristics. Zero matches return not-found or, for an exact
+unbound thread and a control operation, attach-required. Multiple matches
+return `CODEX_TARGET_AMBIGUOUS` with machine-readable choices. The selected
+binding is checked again after acquiring the operation lock; drift returns
+`CODEX_TARGET_CHANGED`.
 
 Aliases are JSON documents under `~/.agent-lane/lanes/codex` by default. They
 contain public execution metadata and binding state, never secrets. A binding
 replacement increments its generation so a caller can distinguish continuity
 of intent from continuity of the underlying task.
 
-The lane's execution mode is written with the binding and cannot change in
-place. Missing mode metadata on a legacy alias resolves to `independent`;
-invalid, empty, or conflicting persisted mode data fails closed.
+The lane's execution mode is written with the binding. Ordinary execution
+cannot change it in place; an explicit `session attach` for the same task may
+rebind the existing lane to a requested mode. Missing mode metadata on a legacy
+alias resolves to `independent`; invalid, empty, or conflicting persisted mode
+data fails closed until an explicit re-attach repairs it.
+
+Discovery and inspection never create a binding. Session projections expose a
+`control` object that distinguishes `unattached` from `attached` tasks and gives
+machine-readable attach arguments based on exact thread IDs and the observed
+transport. A rejected control request additionally returns the complete
+original command as `after_attach_argv`. The authority transition is always a
+separate, explicit `session attach` operation; attach without `--lane-id`
+generates a deterministic internal ID. A new attach defaults to `independent`;
+choosing App Sync remains explicit. Read-only execution and Goal inspection may
+target an exact unbound thread directly, but control operations fail before
+app-server access until attached.
+
+Alias-registry scans used for control or contextual selection fail closed when
+an entry is unreadable because uniqueness cannot then be proven. Exact
+thread-ID reads may bypass unrelated unreadable entries because they do not
+create control authority. Legacy alias files without an embedded `lane_id`
+derive their internal ID from the filename. Successful commands expose
+`target_resolution`; lane identity remains in JSON for durable automation even
+when the human-facing command did not require it.
 
 ## Execution transports
 
@@ -102,9 +134,41 @@ Alias writes use a temporary file followed by an atomic replace. Per-lane and
 per-task locks prevent concurrent callers from starting conflicting turns or
 binding one task to multiple lanes without an explicit replacement path.
 
+`run`, `send`, `status`, `closeout`, `session list`, and `session read` use one
+execution projection. Its precedence is:
+
+1. positive active-turn evidence from the observed Codex thread;
+2. a live local runner process;
+3. an observed terminal turn or inactive thread;
+4. local runner and alias history.
+
+Goal status is separate lifecycle evidence and never overrides an active turn.
+The `execution` object reports the effective state, source, evidence, and stable
+conflict codes. Its `active` value is `null` when neither active nor inactive
+can be established. Compatibility fields mirror the decision:
+`runner_status` is effective, `local_runner_status` is local/cache-only,
+`thread_active` reports observed thread activity, and `last_turn` is normalized
+to the active turn while execution is active. Raw Codex and alias data remain
+available in detailed views as evidence rather than competing decisions.
+
 Long-running commands separate the durable task from the observation window.
 A command timeout limits how long the caller waits; it does not redefine task
-completion. Later `status`, `wait`, or `send` calls resume from durable state.
+completion. Timeout errors carry the same execution projection. A still-active
+or unknown turn recommends observation and is not marked safe for a duplicate
+control retry.
+
+## User defaults
+
+User defaults are stored in `~/.agent-lane/config.json` with an independent
+schema version. Effort resolution is deterministic: explicit `--effort`, then
+the user configuration, then unset so Codex may apply its own default. `xh` is
+accepted as input and normalized to `xhigh`. The effective value and source are
+persisted with the turn metadata and returned in JSON.
+
+Legacy unversioned configuration with a top-level `effort` remains readable;
+conflicting legacy and current fields fail closed. A previous lane alias records
+what an earlier turn used but is not a default for a new turn. agent-lane does
+not write Codex configuration to implement its default.
 
 ## Worktree ownership
 
@@ -163,6 +227,7 @@ src/agent_lane/
   daemon_transport.py shared-daemon discovery and transport
   app_runtime.py     read-only App runtime discovery
   app_sync.py        macOS login integration
+  settings.py        per-user agent-lane defaults
   state.py           lane alias persistence
   workspace.py       worktree and locking rules
   signing.py         isolated SSH signing agent

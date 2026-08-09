@@ -95,6 +95,30 @@ def _add_config(root: argparse._SubParsersAction) -> None:
             provider="agent-lane",
         )
 
+    effort = config_sub.add_parser(
+        "effort",
+        help="Manage the per-user default Codex reasoning effort",
+    )
+    effort_sub = effort.add_subparsers(
+        dest="effort_command",
+        required=True,
+        parser_class=V1ArgumentParser,
+    )
+    effort_set = effort_sub.add_parser("set")
+    effort_set.add_argument("value")
+    effort_set.set_defaults(
+        handler="config.effort.set",
+        command_name="config.effort.set",
+        provider="agent-lane",
+    )
+    for operation in ("status", "clear"):
+        command = effort_sub.add_parser(operation)
+        command.set_defaults(
+            handler=f"config.effort.{operation}",
+            command_name=f"config.effort.{operation}",
+            provider="agent-lane",
+        )
+
 
 def _add_signing(root: argparse._SubParsersAction) -> None:
     signing = root.add_parser(
@@ -124,9 +148,9 @@ def _add_signing(root: argparse._SubParsersAction) -> None:
 
 def _add_execution_commands(codex_sub: argparse._SubParsersAction) -> None:
     run = codex_sub.add_parser(
-        "run", help="Create or resume a lane and run one turn"
+        "run", help="Create or resume a task and run one turn"
     )
-    _add_common(run)
+    _add_lane_target(run, required=False)
     run.add_argument("--cwd")
     run.add_argument("--title")
     run.add_argument("--mode", choices=EXECUTION_MODES)
@@ -141,7 +165,7 @@ def _add_execution_commands(codex_sub: argparse._SubParsersAction) -> None:
     _set(run, "codex.run")
 
     send = codex_sub.add_parser("send", help="Run one follow-up turn")
-    _add_common(send)
+    _add_lane_target(send)
     _add_sandbox(send)
     _add_runtime_options(send)
     _add_commit_signing(send)
@@ -153,14 +177,14 @@ def _add_execution_commands(codex_sub: argparse._SubParsersAction) -> None:
     steer = codex_sub.add_parser(
         "steer", help="Add input to an active App Sync turn"
     )
-    _add_common(steer)
+    _add_lane_target(steer)
     _add_prompt(steer)
     steer.add_argument("--turn-id")
     steer.add_argument("--timeout", type=float, default=20.0)
     _set(steer, "codex.steer")
 
-    status = codex_sub.add_parser("status", help="Read lane execution status")
-    _add_common(status)
+    status = codex_sub.add_parser("status", help="Read task execution status")
+    _add_lane_target(status)
     status.add_argument(
         "--detail",
         choices=("summary", "full", "turns"),
@@ -169,29 +193,29 @@ def _add_execution_commands(codex_sub: argparse._SubParsersAction) -> None:
     _set(status, "codex.status")
 
     closeout = codex_sub.add_parser("closeout", help="Read completion and Git state")
-    _add_common(closeout)
+    _add_lane_target(closeout)
     _set(closeout, "codex.closeout")
 
     cleanup = codex_sub.add_parser("cleanup", help="Remove a safe managed worktree")
-    _add_common(cleanup)
+    _add_lane_target(cleanup)
     cleanup.add_argument("--delete-branch", action="store_true")
     cleanup.add_argument("--confirm-thread-inactive", action="store_true")
     _set(cleanup, "codex.cleanup")
 
-    wait = codex_sub.add_parser("wait", help="Wait for one lane turn")
-    _add_common(wait)
+    wait = codex_sub.add_parser("wait", help="Wait for one task turn")
+    _add_lane_target(wait)
     _add_observe_options(wait)
     _set(wait, "codex.wait")
 
     watch = codex_sub.add_parser("watch", help="Emit polling snapshots as JSONL")
-    _add_common(watch)
+    _add_lane_target(watch)
     _add_observe_options(watch)
     _set(watch, "codex.watch", jsonl_output=True)
 
     checkpoint = codex_sub.add_parser(
         "checkpoint", help="Wait once and return a lane snapshot"
     )
-    _add_common(checkpoint)
+    _add_lane_target(checkpoint)
     checkpoint.add_argument("--after", dest="after_seconds", type=float, default=300.0)
     _set(checkpoint, "codex.checkpoint")
 
@@ -205,7 +229,7 @@ def _add_goal_commands(codex_sub: argparse._SubParsersAction) -> None:
     )
 
     set_command = goal_sub.add_parser("set")
-    _add_common(set_command)
+    _add_lane_target(set_command, required=False)
     set_command.add_argument("--cwd")
     set_command.add_argument("--title")
     _add_sandbox(set_command)
@@ -227,7 +251,7 @@ def _add_goal_commands(codex_sub: argparse._SubParsersAction) -> None:
     _set(set_command, "codex.goal.set")
 
     run = goal_sub.add_parser("run")
-    _add_common(run)
+    _add_lane_target(run)
     _add_sandbox(run)
     _add_runtime_options(run)
     _add_commit_signing(run)
@@ -239,7 +263,7 @@ def _add_goal_commands(codex_sub: argparse._SubParsersAction) -> None:
 
     for operation in ("get", "complete", "clear"):
         command = goal_sub.add_parser(operation)
-        _add_common(command)
+        _add_lane_target(command)
         _set(command, f"codex.goal.{operation}")
 
 
@@ -260,10 +284,14 @@ def _add_session_commands(codex_sub: argparse._SubParsersAction) -> None:
     _add_session_query_options(find)
     _set(find, "codex.session.find")
 
-    attach = session_sub.add_parser("attach")
-    _add_common(attach)
+    attach = session_sub.add_parser(
+        "attach",
+        help="Explicitly bind an existing Codex task for control",
+    )
+    attach.add_argument("--lane-id", help="Optional internal stable lane identifier")
+    _add_alias_root(attach)
     attach.add_argument("--thread-id", required=True)
-    attach.add_argument("--mode", choices=EXECUTION_MODES, required=True)
+    attach.add_argument("--mode", choices=EXECUTION_MODES)
     attach.add_argument("--cwd")
     attach.add_argument("--title")
     _add_sandbox(attach)
@@ -280,7 +308,7 @@ def _add_session_commands(codex_sub: argparse._SubParsersAction) -> None:
     get.add_argument("--observe", choices=("stored", "live"), default="stored")
     _set(get, "codex.session.name.get")
     set_command = name_sub.add_parser("set")
-    _add_common(set_command)
+    _add_lane_target(set_command)
     set_command.add_argument("--title", required=True)
     set_command.add_argument("--expected-title")
     _set(set_command, "codex.session.name.set")
@@ -311,8 +339,23 @@ def _add_session_query_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--detail", choices=("metadata", "summary"), default="summary")
 
 
-def _add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--lane-id", required=True, help="Stable lane identifier")
+def _add_lane_target(
+    parser: argparse.ArgumentParser,
+    *,
+    required: bool = True,
+) -> None:
+    target = parser.add_mutually_exclusive_group(required=required)
+    target.add_argument(
+        "--lane-id",
+        help="Internal stable lane identifier (optional for normal use)",
+    )
+    target.add_argument("--thread-id", help="Exact Codex thread/session identifier")
+    target.add_argument("--target-title", help="Exact known task title")
+    target.add_argument(
+        "--current",
+        action="store_true",
+        help="Resolve the only task bound to the current working directory",
+    )
     _add_alias_root(parser)
 
 
@@ -320,6 +363,8 @@ def _add_thread_target(parser: argparse.ArgumentParser) -> None:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--lane-id")
     target.add_argument("--thread-id")
+    target.add_argument("--target-title")
+    target.add_argument("--current", action="store_true")
     _add_alias_root(parser)
 
 

@@ -1017,7 +1017,7 @@ def test_daemon_cli_does_not_mask_socket_failure_with_fallback(tmp_path):
     assert calls == [str(path_cli)]
 
 
-def test_daemon_cli_does_not_mask_malformed_version_response(tmp_path):
+def test_daemon_cli_falls_back_after_candidate_specific_probe_failure(tmp_path):
     path_cli = tmp_path / "path-codex"
     path_cli.write_text("path", encoding="utf-8")
     path_cli.chmod(0o700)
@@ -1037,22 +1037,27 @@ def test_daemon_cli_does_not_mask_malformed_version_response(tmp_path):
 
     def probe(candidate):
         calls.append(candidate)
-        raise DaemonVersionError(
-            "daemon version output did not contain JSON"
+        if candidate == str(path_cli):
+            raise DaemonVersionError(
+                "daemon version output did not contain JSON"
+            )
+        return DaemonVersionInfo(
+            cli_version="0.145.0",
+            app_server_version="0.145.0",
+            socket_path=tmp_path / "daemon.sock",
         )
 
-    with pytest.raises(
-        DaemonVersionError,
-        match="did not contain JSON",
-    ):
-        resolve_compatible_daemon_cli(
-            "codex",
-            home=tmp_path / "home",
-            which_command=lambda _name: str(path_cli),
-            probe=probe,
-        )
+    resolved = resolve_compatible_daemon_cli(
+        "codex",
+        home=tmp_path / "home",
+        which_command=lambda _name: str(path_cli),
+        probe=probe,
+    )
 
-    assert calls == [str(path_cli)]
+    assert resolved.path == managed_cli
+    assert resolved.source == "managed_standalone"
+    assert resolved.fallback_used is True
+    assert calls == [str(path_cli), str(managed_cli)]
 
 
 def test_daemon_cli_rejects_app_bundle_symlink_escape(tmp_path):

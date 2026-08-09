@@ -10,8 +10,8 @@ V1 supports Codex as its first coding agent.
 [Architecture](https://github.com/Unitary-orz/agent-lane/blob/main/docs/architecture.md) ·
 [Changelog](https://github.com/Unitary-orz/agent-lane/blob/main/CHANGELOG.md)
 
-> Current version: `1.0.0-rc.1`. Python packaging tools may display the
-> equivalent version `1.0.0rc1`.
+> Current version: `1.0.0-rc.2`. Python packaging tools may display the
+> equivalent version `1.0.0rc2`.
 
 ## See what it does in a real conversation
 
@@ -34,7 +34,7 @@ workspace context remain available.
 ```bash
 agent-lane codex session list --scope all --limit 10
 agent-lane codex send \
-  --lane-id settings-page \
+  --thread-id "<thread-id-from-item-2>" \
   --prompt "Implement the approved settings changes and run focused tests."
 ```
 
@@ -46,29 +46,43 @@ instead of creating disconnected coding tasks.
 
 ### “Start implementing the new login flow”
 
-The assistant creates a named lane and delegates the task to Codex:
+The assistant starts a named task and delegates it to Codex. No lane ID is
+needed for the normal create path:
 
 ```bash
 agent-lane codex run \
-  --lane-id login-flow \
+  --title login-flow \
   --cwd /path/to/project \
   --commit-signing off \
   --prompt "Implement the new login flow and run its focused tests."
 ```
 
-`login-flow` becomes the durable name for that coding session. If the work is
-paused today, the assistant can return to it tomorrow without asking the human
-for a Codex task ID.
+agent-lane generates and persists an internal stable lane ID, while
+`login-flow` is the human-facing title. If the work is paused today, discovery
+returns the exact thread target needed to continue it; the human does not have
+to name or remember a lane ID.
+
+To keep one reasoning effort as the user default, configure agent-lane once:
+
+```bash
+agent-lane config effort set xh
+agent-lane config effort status
+```
+
+`xh` is normalized to `xhigh`. A later `run`, `send`, or `goal run` uses this
+default unless that command passes `--effort`; the explicit command value wins.
+The JSON reports `effective_effort` and `effective_effort_source`. This setting
+is stored in `~/.agent-lane/config.json` and does not modify Codex configuration.
 
 ### “What happened in the login session?”
 
 The assistant can inspect a session without starting another coding turn:
 
 ```bash
-agent-lane codex status --lane-id login-flow
-agent-lane codex session outline --lane-id login-flow
-agent-lane codex session read --lane-id login-flow --include-turns
-agent-lane codex closeout --lane-id login-flow
+agent-lane codex status --thread-id "<selected-thread-id>"
+agent-lane codex session outline --thread-id "<selected-thread-id>"
+agent-lane codex session read --thread-id "<selected-thread-id>" --include-turns
+agent-lane codex closeout --thread-id "<selected-thread-id>"
 ```
 
 This lets the assistant answer practical questions such as:
@@ -79,19 +93,44 @@ This lets the assistant answer practical questions such as:
 
 Reading a session does not silently start more work.
 
+State-bearing results use `execution` as the canonical decision object.
+`execution.state` is `active`, `inactive`, or `unknown`; `execution.evidence`
+records the observed thread, local runner, last turn, and Goal, while
+`execution.conflicts` preserves disagreements. Positive active-thread or live
+runner evidence wins over cached terminal fields and Goal lifecycle state.
+`runner_status` is the effective turn status; `local_runner_status` is only the
+local runner/cache status. A blocked or completed Goal therefore does not make
+an actually running turn inactive.
+
 ### “Continue that session and finish the tests”
 
-The assistant sends a follow-up to the existing lane:
+The assistant sends a follow-up to the selected task:
 
 ```bash
 agent-lane codex send \
-  --lane-id login-flow \
+  --thread-id "<selected-thread-id>" \
   --prompt "Fix the remaining test failures and rerun the focused suite."
 ```
 
 Codex continues with the same conversation and workspace context. `run` also
-has create-or-resume behavior, so the assistant can safely use the same lane in
-repeatable workflows.
+has create-or-resume behavior. Automation that already owns a lane ID may still
+pass `--lane-id`; normal interactive use can continue from the selected thread.
+
+### Task targets and fail-closed selection
+
+Commands that operate on one task accept one of four mutually exclusive
+targets: `--thread-id` for an exact discovered session, `--target-title` for an
+exact known attached title, `--current` for the only attached task whose stored
+workspace equals the process working directory, or `--lane-id` for compatible
+automation. `run` and `goal set` may omit all four to create a new task with an
+internally generated lane ID.
+
+Title matching is exact and case-insensitive; `--current` does not mean “most
+recent.” If a title or current directory matches more than one task, the command
+fails with `CODEX_TARGET_AMBIGUOUS` and returns `choices[].target_argv`. It never
+guesses. Successful results report the requested and resolved identities in
+`target_resolution`. A binding change between selection and control fails with
+`CODEX_TARGET_CHANGED`.
 
 ## Codex support
 
@@ -121,11 +160,38 @@ databases or App UI automation.
 | --- | --- | --- |
 | `codex session list` | `thread/list` | Lists recent main tasks or all task threads using stored or live observation. |
 | `codex session find` | `thread/list` with search and local matching | Searches titles, prompts, lane metadata, workspace information, and task summaries. |
-| `codex session attach` | `thread/read` | Validates an existing task, then binds it to a stable lane ID and execution mode. |
+| `codex session attach` | `thread/read` | Validates an existing task, then binds it to an internal stable lane ID and execution mode; a caller-supplied lane ID is optional. |
 | `codex session name get` | `thread/read` | Reads the stored or live Codex task name. |
 | `codex session name set` | `thread/name/set`, then `thread/read` | Updates the Codex task name with optional conflict checking and exact read-back. |
 | `codex session outline` | `thread/read` | Returns a compact projection of task identity, turns, prompts, and execution state. |
 | `codex session read` | `thread/read` | Reads the full task, all turns, or one selected turn. |
+
+`session list` and `session read` include a machine-readable `control` object.
+An unbound task remains read-only and reports `requires_explicit_attach: true`
+plus an `attach_argv` suggestion. Stored observation suggests `independent`;
+live observation suggests `app-sync`. Control begins only after an explicit
+attach:
+
+```bash
+agent-lane codex session read --thread-id "<task-id>" --include-turns
+agent-lane codex session attach \
+  --thread-id "<task-id>"
+agent-lane codex send \
+  --thread-id "<task-id>" \
+  --prompt "Continue the verified task."
+```
+
+Attach defaults to `independent`; pass `--mode app-sync` explicitly when shared
+App control is required. The first attach generates an internal stable lane ID
+when none is supplied, and a repeated attach of the same thread reuses it. An
+explicit repeated attach may change that lane's execution mode without creating
+a second binding.
+Neither discovery nor reading creates a lane binding. Read-only `status`,
+`wait`, `checkpoint`, `closeout`, and `goal get` can inspect an exact unbound
+thread without attaching; a control command instead returns
+`CODEX_TARGET_ATTACH_REQUIRED` with separate `attach_argv` and
+`after_attach_argv` steps. The latter preserves the complete original control
+request; read-only projections do not invent a follow-up prompt.
 
 ### Goals and runtime controls
 
@@ -137,11 +203,14 @@ databases or App UI automation.
 | `codex goal complete` | `thread/goal/set` | Marks the current goal complete. |
 | `codex goal clear` | `thread/goal/clear` | Removes the goal from the Codex task. |
 | `--sandbox`, `--model`, `--profile`, `--effort`, `--add-dir`, `--config` | app-server startup plus thread and turn parameters | Passes supported runtime selection and configuration into the Codex execution path. |
+| `config effort set/status/clear` | agent-lane user configuration | Manages the default turn effort without rewriting Codex configuration; explicit `--effort` takes precedence. |
 | `codex run --worktree` | Git worktree plus `runtimeWorkspaceRoots` | Creates an isolated workspace, records ownership, and binds it to the Codex task. |
 
 Normal commands return one structured JSON envelope. `codex watch` emits JSONL.
 Command timeouts limit how long the caller observes a task; they do not redefine
-the durable Codex task's completion state.
+the durable Codex task's completion state. Timeout errors include the same
+`execution` evidence and recommend observation instead of a duplicate `send`
+when the turn is still active or its state is unknown.
 
 ### App Sync
 
@@ -152,7 +221,7 @@ App Sync exposes the following Codex App integration directly:
 | `config app-sync enable` | Enables shared App/agent task access at login. | Installs and loads the per-user managed runtime and advertises the login environment to newly opened App processes. |
 | `config app-sync status` | Reports persistent App Sync readiness. | Checks the managed runtime, socket, compatible Codex CLI, and login configuration. |
 | `doctor --mode app-sync --probe` | Verifies end-to-end shared control. | Opens the local WebSocket and completes a JSON-RPC `initialize` probe. |
-| `codex run --mode app-sync` | Creates or resumes a task visible to both agent-lane and Codex App. | Uses the shared runtime transport and persists `app-sync` as the lane's fixed execution mode. |
+| `codex run --mode app-sync` | Creates or resumes a task visible to both agent-lane and Codex App. | Uses the shared runtime transport and persists `app-sync` as the lane's execution mode. |
 | `codex session list --observe live`, `codex session find --observe live` | Lists or searches current App-visible tasks. | Queries `thread/list` through the shared control plane instead of the independent stdio transport. |
 | `codex session name get --observe live`, `codex session outline --observe live`, `codex session read --observe live` | Reads current App-visible task metadata, messages, and turn state. | Queries `thread/read` through the shared control plane. |
 | `codex session attach --mode app-sync` | Brings an App-created Codex task under lane management. | Validates the task, acquires task/lane locks, and stores the lane binding. |

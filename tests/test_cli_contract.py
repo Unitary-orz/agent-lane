@@ -13,6 +13,9 @@ from agent_lane.cli import build_parser, main
         ["signing", "init", "--generate"],
         ["config", "app-sync", "enable"],
         ["config", "app-sync", "status"],
+        ["config", "effort", "set", "xh"],
+        ["config", "effort", "status"],
+        ["config", "effort", "clear"],
         ["doctor", "--mode", "app-sync", "--probe"],
         [
             "codex",
@@ -70,8 +73,6 @@ from agent_lane.cli import build_parser, main
             "imported-task",
             "--thread-id",
             "task-id",
-            "--mode",
-            "independent",
         ],
         ["codex", "session", "name", "get", "--lane-id", "imported-task"],
         [
@@ -165,7 +166,7 @@ def test_usage_failure_is_one_json_envelope(capsys):
         "data": None,
         "error": {
             "code": "CLI_USAGE_ERROR",
-            "message": "the following arguments are required: --lane-id",
+            "message": "one of the arguments --prompt --prompt-file is required",
             "retryable": False,
             "details": {},
         },
