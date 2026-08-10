@@ -6,7 +6,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] 🚧
 
-> No unreleased changes yet.
+### 🐞 Fixed
+
+- Fixed GitHub Actions annotated-tag validation by fetching the original remote
+  tag object into a dedicated verification ref before inspecting it.
 
 ## [v1.0.0-rc.2] - 2026-08-09 🚀
 

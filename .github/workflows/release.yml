@@ -70,12 +70,16 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           REPOSITORY_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
-          TAG_OBJECT_TYPE="$(git cat-file -t "${TAG}")"
+          REMOTE_TAG_REF="refs/tags/${TAG}"
+          VERIFICATION_REF="refs/agent-lane/release-tags/${TAG}"
+          git fetch --no-tags --force origin \
+            "${REMOTE_TAG_REF}:${VERIFICATION_REF}"
+          TAG_OBJECT_TYPE="$(git cat-file -t "${VERIFICATION_REF}")"
           if [ "${TAG_OBJECT_TYPE}" != "tag" ]; then
             echo "Release tags must be annotated; ${TAG} is ${TAG_OBJECT_TYPE}." >&2
             exit 1
           fi
-          RELEASE_COMMIT="$(git rev-list -n 1 "${TAG}")"
+          RELEASE_COMMIT="$(git rev-list -n 1 "${VERIFICATION_REF}")"
           test "$(git rev-parse HEAD)" = "${RELEASE_COMMIT}"
           PREVIOUS_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
           ARGS=(
