@@ -109,11 +109,12 @@ def test_adopt_binds_existing_app_thread_to_lane(tmp_path, monkeypatch, capsys):
     assert alias["execution_mode_source"] == "explicit"
     assert alias["adopted_from"] == "codex-app"
     assert alias["cwd"] == str(workspace)
-    assert alias["title"] == "Custom lane title"
-    assert alias["lane_label"] == "Custom lane title"
+    assert alias["custom_title"] == "Custom lane title"
+    assert "title" not in alias
+    assert "lane_label" not in alias
     assert alias["codex_title"] == "App task"
-    assert result["title"] == "App task"
-    assert result["title_source"] == "codex_title"
+    assert result["lane_title"] == "Custom lane title"
+    assert result["lane_title_source"] == "custom_title"
     assert result["control"] == {
         "binding_status": "attached",
         "control_ready": True,
@@ -319,7 +320,7 @@ def test_send_refreshes_adopted_thread_cwd_before_resume(tmp_path, monkeypatch, 
         {
             "codex_thread_id": "thread-app",
             "cwd": str(old_workspace),
-            "title": "App task",
+            "custom_title": "App task",
             "sandbox": "workspace-write",
             "model": "gpt-alias",
             "adopted_from": "codex-app",

@@ -60,18 +60,25 @@ user selection -> target resolver -> internal lane ID -> binding generation -> C
 ```
 
 The resolver accepts one explicit selector: exact `thread-id`, exact
-case-insensitive attached title, the unique attached task for the current
-working directory, or a lane ID retained for automation compatibility. It does
-not apply recency heuristics. Zero matches return not-found or, for an exact
-unbound thread and a control operation, attach-required. Multiple matches
-return `CODEX_TARGET_AMBIGUOUS` with machine-readable choices. The selected
-binding is checked again after acquiring the operation lock; drift returns
-`CODEX_TARGET_CHANGED`.
+case-insensitive attached `custom_title` or `codex_title`, the unique attached
+task for the current working directory, or a lane ID retained for automation
+compatibility. It does not apply recency heuristics. Zero matches return
+not-found or, for an exact unbound thread and a control operation,
+attach-required. Multiple matches return `CODEX_TARGET_AMBIGUOUS` with
+machine-readable choices. The selected binding is checked again after acquiring
+the operation lock; drift returns `CODEX_TARGET_CHANGED`.
 
 Aliases are JSON documents under `~/.agent-lane/lanes/codex` by default. They
 contain public execution metadata and binding state, never secrets. A binding
 replacement increments its generation so a caller can distinguish continuity
 of intent from continuity of the underlying task.
+
+`codex_title` is the latest observed Codex task name. `custom_title` exists only
+after an explicit user setting. Command results compute
+`lane_title = custom_title ?? codex_title ?? lane_id` and report
+`lane_title_source`; neither computed field is persisted. Alias schema v4
+removes the former `title`, `title_source`, `lane_label`, and persisted computed
+title fields.
 
 The lane's execution mode is written with the binding. Ordinary execution
 cannot change it in place; an explicit `session attach` for the same task may

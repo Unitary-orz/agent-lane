@@ -104,7 +104,7 @@ def _save_target_alias(alias_root, lane_id, thread_id, cwd, title):
             "codex_thread_id": thread_id,
             "cwd": str(cwd),
             "codex_title": title,
-            "lane_label": title,
+            "custom_title": title,
             "execution_mode": "independent",
             "execution_mode_source": "explicit",
             "commit_signing": {"mode": "off"},
@@ -175,7 +175,12 @@ def test_run_without_lane_id_generates_internal_identity(
         "lane_id": result["lane_id"],
         "thread_id": result["codex_thread_id"],
     }
-    assert load_alias("codex", result["lane_id"], aliases) is not None
+    alias = load_alias("codex", result["lane_id"], aliases)
+    assert alias is not None
+    assert "custom_title" not in alias
+    assert alias["codex_title"] == "workspace"
+    assert result["lane_title"] == "workspace"
+    assert result["lane_title_source"] == "codex_title"
 
 
 def test_session_attach_without_lane_id_creates_stable_internal_binding(
@@ -342,6 +347,9 @@ def test_goal_set_without_lane_id_generates_internal_identity(
         "thread_id": result["codex_thread_id"],
     }
     assert result["goal"]["objective"] == "finish"
+    assert result["custom_title"] == "Goal task"
+    assert result["lane_title"] == "Goal task"
+    assert result["lane_title_source"] == "custom_title"
 
 
 def test_session_name_set_resolves_attached_thread_without_lane_id(
@@ -616,7 +624,7 @@ def test_unique_current_context_resolves_without_lane_id(
     assert result["target_resolution"]["source"] == "current_cwd"
 
 
-def test_legacy_alias_without_embedded_lane_id_resolves_by_exact_title(
+def test_removed_legacy_title_is_not_a_target_selector(
     tmp_path, monkeypatch, capsys
 ):
     _reset_fake(monkeypatch)
@@ -650,9 +658,8 @@ def test_legacy_alias_without_embedded_lane_id_resolves_by_exact_title(
     )
     result = decode_cli_output(capsys.readouterr().out)
 
-    assert rc == 0, result
-    assert result["lane_id"] == "legacy-task"
-    assert result["target_resolution"]["source"] == "exact_title"
+    assert rc == 1
+    assert result["error_code"] == "CODEX_TARGET_NOT_FOUND"
 
 
 def test_invalid_alias_registry_fails_closed_before_target_selection(

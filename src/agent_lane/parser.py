@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_execution_commands(codex_sub)
     _add_goal_commands(codex_sub)
+    _add_custom_title_commands(codex_sub)
     _add_session_commands(codex_sub)
     return parser
 
@@ -265,6 +266,28 @@ def _add_goal_commands(codex_sub: argparse._SubParsersAction) -> None:
         command = goal_sub.add_parser(operation)
         _add_lane_target(command)
         _set(command, f"codex.goal.{operation}")
+
+
+def _add_custom_title_commands(codex_sub: argparse._SubParsersAction) -> None:
+    custom_title = codex_sub.add_parser(
+        "custom-title",
+        help="Manage the explicit local display title for a lane",
+    )
+    custom_title_sub = custom_title.add_subparsers(
+        dest="custom_title_command",
+        required=True,
+        parser_class=V1ArgumentParser,
+    )
+    get = custom_title_sub.add_parser("get")
+    _add_lane_target(get)
+    _set(get, "codex.custom-title.get")
+    set_command = custom_title_sub.add_parser("set")
+    _add_lane_target(set_command)
+    set_command.add_argument("--title", required=True)
+    _set(set_command, "codex.custom-title.set")
+    clear = custom_title_sub.add_parser("clear")
+    _add_lane_target(clear)
+    _set(clear, "codex.custom-title.clear")
 
 
 def _add_session_commands(codex_sub: argparse._SubParsersAction) -> None:

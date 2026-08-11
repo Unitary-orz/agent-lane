@@ -8,7 +8,7 @@ V1 首先支持 Codex coding agent。
 
 [English](README.md) · [架构说明](docs/architecture.md) · [变更记录](CHANGELOG.md)
 
-> 当前版本：`1.0.0-rc.2`。Python 打包工具可能显示等价版本 `1.0.0rc2`。
+> 当前版本：`1.0.0-rc.3`。Python 打包工具可能显示等价版本 `1.0.0rc3`。
 
 ## 看一段真实的使用过程
 
@@ -51,9 +51,11 @@ agent-lane codex run \
   --prompt "落地新的登录流程，并运行相关测试。"
 ```
 
-agent-lane 会生成并保存内部稳定 lane ID，`login-flow` 是面向 Human 的标题。今天
-暂停后，发现结果会给出继续该会话所需的精确 thread 目标；Human 不需要创建或记住
-lane ID。
+agent-lane 会生成并保存内部稳定 lane ID。显式传入的 `--title login-flow` 会把
+`login-flow` 保存为 `custom_title`，同时作为新 Codex task 的初始名称。省略
+`--title` 时不会保存自定义标题，lane 会跟随最近观察到的 Codex task 名称。结果用
+`lane_title = custom_title ?? codex_title ?? lane_id` 与 `lane_title_source` 报告
+最终标题；Human 不需要创建或记住 lane ID。
 
 如果希望固定用户级 reasoning effort，只需配置一次 agent-lane：
 
@@ -110,9 +112,10 @@ Codex 会沿用同一段对话和工作目录上下文。`run` 本身也采用�
 ### Task 目标与 fail-closed 选择
 
 针对单个 task 的命令接受四种互斥目标之一：`--thread-id` 表示发现结果中的精确
-session，`--target-title` 表示已绑定 task 的精确已知标题，`--current` 表示保存的
-工作目录与当前进程目录相同的唯一已绑定 task，`--lane-id` 则保留给兼容自动化。
-`run` 和 `goal set` 可以完全省略目标，此时创建新 task 并生成内部 lane ID。
+session，`--target-title` 表示已绑定 task 的精确已知自定义标题或 Codex 标题，
+`--current` 表示保存的工作目录与当前进程目录相同的唯一已绑定 task，`--lane-id`
+则保留给兼容自动化。`run` 和 `goal set` 可以完全省略目标，此时创建新 task 并生成
+内部 lane ID。
 
 标题匹配不区分大小写但必须完整相等；`--current` 不表示“最近一个”。标题或当前
 目录命中多个候选时，命令以 `CODEX_TARGET_AMBIGUOUS` 失败，并返回
@@ -150,6 +153,7 @@ Codex 私有数据库，也不自动操作 App UI。
 | `codex session attach` | `thread/read` | 校验已有 task，再绑定到内部稳定 lane ID 和指定执行模式；调用方可不提供 lane ID。 |
 | `codex session name get` | `thread/read` | 读取 stored 或 live Codex task 名称。 |
 | `codex session name set` | `thread/name/set`，然后 `thread/read` | 可带冲突检查更新 task 名称，并精确读回确认。 |
+| `codex custom-title get/set/clear` | 本地 lane alias | 读取、设置或清除 `lane_title` 使用的显式本地覆盖；不会重命名 Codex task。 |
 | `codex session outline` | `thread/read` | 返回 task 身份、turn、prompt 和执行状态的紧凑投影。 |
 | `codex session read` | `thread/read` | 读取完整 task、全部 turn，或指定的一个 turn。 |
 

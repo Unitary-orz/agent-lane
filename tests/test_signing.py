@@ -788,7 +788,7 @@ def test_loaded_app_thread_requires_explicit_replacement_authorization(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -859,7 +859,7 @@ def test_loaded_app_thread_defaults_to_off_without_probe_or_replacement(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
             "execution_mode": "app-sync",
@@ -911,7 +911,7 @@ def test_live_goal_read_failure_stops_before_replacement_creation(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -968,7 +968,7 @@ def test_loaded_adopted_app_thread_moves_to_verified_managed_thread(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task [agent-lane]",
+            "codex_title": "Existing App task [agent-lane]",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
             "last_completed_final_text": (
@@ -1009,14 +1009,14 @@ def test_loaded_adopted_app_thread_moves_to_verified_managed_thread(
     assert output["thread_replaced"] is True
     assert output["origin_thread_id"] == "thread-app"
     assert output["codex_thread_id"] == "thread-managed"
-    assert output["title"] == "Existing App task [agent-lane]"
-    assert output["title_source"] == "codex_title"
+    assert output["lane_title"] == "Existing App task [agent-lane]"
+    assert output["lane_title_source"] == "codex_title"
     assert output["commit_signing"]["effective"] is True
     assert output["commit_signing"]["effective_thread_id"] == "thread-managed"
     assert output["commit_signing"]["verification"] == "thread_shell_probe_idle"
     assert alias["codex_thread_id"] == "thread-managed"
     assert alias["origin_codex_thread_id"] == "thread-app"
-    assert alias["title"] == "Existing App task"
+    assert "title" not in alias
     assert alias["codex_title"] == "Existing App task [agent-lane]"
     assert alias["binding"]["generation"] == 2
     assert alias["binding"]["thread_id"] == "thread-managed"
@@ -1056,7 +1056,7 @@ def test_loaded_adopted_app_thread_moves_to_verified_managed_thread(
         {"name": "Existing App task [agent-lane]"},
     )
     assert alias["codex_title"] == "Existing App task [agent-lane]"
-    assert alias["title"] == "Existing App task"
+    assert "title" not in alias
     assert cli._signing_replacement_titles(
         "Existing App task [agent-lane] [agent-lane]"
     ) == (
@@ -1083,7 +1083,7 @@ def test_send_goal_refresh_failure_uses_copied_live_goal(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
             "mode": "goal",
@@ -1184,7 +1184,7 @@ def test_run_replacement_refreshes_copied_live_goal_without_override(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -1248,7 +1248,7 @@ def test_send_replacement_does_not_revive_stale_alias_goal(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
             "mode": "goal",
@@ -1323,7 +1323,7 @@ def test_unloaded_adopted_app_thread_cold_resumes_with_verified_signing(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -1378,7 +1378,7 @@ def test_cold_probe_failure_does_not_create_unauthorized_replacement(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -1436,7 +1436,7 @@ def test_loaded_managed_thread_reprobes_persisted_signing_verification(
         {
             "codex_thread_id": "thread-managed",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "commit_signing": {
                 "mode": "agent",
@@ -1507,7 +1507,7 @@ def test_replacement_probe_failure_keeps_original_alias_and_starts_no_user_turn(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -1562,7 +1562,7 @@ def test_replacement_probe_waits_for_idle_before_user_turn(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -1620,7 +1620,7 @@ def test_replacement_alias_save_failure_archives_unbound_task(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -1691,7 +1691,7 @@ def test_goal_migration_failure_archives_unbound_replacement(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing goal task",
+            "codex_title": "Existing goal task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
             "mode": "goal",
@@ -1796,7 +1796,7 @@ def test_goal_run_stops_before_replacement_when_live_goal_is_not_active(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing goal task",
+            "codex_title": "Existing goal task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
             "mode": "goal",
@@ -1868,7 +1868,7 @@ def test_run_goal_override_failure_archives_unbound_replacement(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing App task",
+            "codex_title": "Existing App task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
         },
@@ -1939,7 +1939,7 @@ def test_goal_runner_moves_loaded_app_goal_to_managed_signing_thread(
         {
             "codex_thread_id": "thread-app",
             "cwd": str(workspace),
-            "title": "Existing goal task",
+            "codex_title": "Existing goal task",
             "sandbox": "danger-full-access",
             "adopted_from": "codex-app",
             "mode": "goal",

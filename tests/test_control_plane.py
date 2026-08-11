@@ -140,6 +140,19 @@ def test_parser_exposes_v1_runtime_and_session_options(tmp_path):
     assert name_get.name_command == "get"
     assert name_set.title == "New title"
     assert name_set.expected_title == "Old title"
+    custom_title_set = parser.parse_args(
+        [
+            "codex",
+            "custom-title",
+            "set",
+            "--lane-id",
+            "lane-1",
+            "--title",
+            "Pinned local title",
+        ]
+    )
+    assert custom_title_set.custom_title_command == "set"
+    assert custom_title_set.title == "Pinned local title"
     goal_run = parser.parse_args(
         [
             "codex",
@@ -286,7 +299,7 @@ def test_run_explicit_cwd_rebind_replaces_not_loaded_thread(
         {
             "codex_thread_id": "thread-origin",
             "cwd": str(stored_cwd),
-            "title": "Lane",
+            "custom_title": "Lane",
             "sandbox": "danger-full-access",
             "commit_signing": {"mode": "off"},
             "last_completed_final_text": "Previous result",
@@ -382,7 +395,7 @@ def test_workspace_drift_error_marks_turn_interrupted_and_returns_recovery(
         {
             "codex_thread_id": "thread-1",
             "cwd": str(cwd),
-            "title": "Lane",
+            "custom_title": "Lane",
             "sandbox": "danger-full-access",
             "commit_signing": {"mode": "off"},
         },
@@ -439,7 +452,7 @@ def test_workspace_rebind_requires_explicit_active_goal_objective(
         {
             "codex_thread_id": "thread-origin",
             "cwd": str(stored_cwd),
-            "title": "Goal lane",
+            "custom_title": "Goal lane",
             "sandbox": "danger-full-access",
             "commit_signing": {"mode": "off"},
             "goal": {
@@ -1273,7 +1286,7 @@ def test_status_summary_is_compact_machine_readable_json(
         "lane-1",
         {
             "codex_thread_id": "thread-1",
-            "title": "Compact lane",
+            "custom_title": "Compact lane",
             "cwd": str(tmp_path),
             "last_status": "timed_out",
             "last_error_code": "TURN_TIMEOUT",
@@ -1312,12 +1325,12 @@ def test_status_summary_is_compact_machine_readable_json(
     assert result == {
         "ok": True,
         "lane_id": "lane-1",
-        "title": "Compact lane",
-        "title_source": "lane_label",
+        "lane_title": "Compact lane",
+        "lane_title_source": "custom_title",
         "codex_title": None,
         "codex_title_observation": "unknown",
         "codex_title_observed_at": None,
-        "lane_label": "Compact lane",
+        "custom_title": "Compact lane",
         "cwd": str(tmp_path),
         "codex_thread_id": "thread-1",
         "codex_url": "codex://threads/thread-1",
@@ -1369,7 +1382,7 @@ def test_status_summary_and_closeout_split_running_turn_from_completed_lead(
         "lane-1",
         {
             "codex_thread_id": "thread-1",
-            "title": "Running follow-up",
+            "custom_title": "Running follow-up",
             "cwd": str(tmp_path),
             "last_status": "inProgress",
             "last_final_text": "Previous fix is complete.\n\nOld details.",
@@ -1435,7 +1448,6 @@ def test_turn_alias_keeps_completed_final_when_later_turn_is_interrupted(tmp_pat
         "lane-1",
         "thread-1",
         str(tmp_path),
-        "Lane",
         "danger-full-access",
         interrupted,
     )
@@ -1455,7 +1467,6 @@ def test_turn_alias_keeps_completed_final_when_later_turn_is_interrupted(tmp_pat
         "lane-1",
         "thread-1",
         str(tmp_path),
-        "Lane",
         "danger-full-access",
         completed,
     )
@@ -1478,7 +1489,6 @@ def test_interrupted_first_turn_does_not_create_completed_final_lead(tmp_path):
         "lane-1",
         "thread-1",
         str(tmp_path),
-        "Lane",
         "danger-full-access",
         interrupted,
     )
@@ -1510,7 +1520,6 @@ def test_completed_turn_without_final_does_not_reuse_previous_current_lead(tmp_p
         "lane-1",
         "thread-1",
         str(tmp_path),
-        "Lane",
         "danger-full-access",
         completed,
     )
@@ -1542,7 +1551,7 @@ def test_closeout_summarizes_clean_and_dirty_git_repo(
         "lane-1",
         {
             "codex_thread_id": "thread-1",
-            "title": "Closeout lane",
+            "custom_title": "Closeout lane",
             "cwd": str(repo),
             "last_status": "timed_out",
             "last_final_text": "Delivered the requested change.\n\nDetails.",
@@ -1654,7 +1663,7 @@ def test_status_and_closeout_fall_back_to_adopted_not_loaded_rollout(
         "app-task",
         {
             "codex_thread_id": "thread-app",
-            "title": "Adopted App task",
+            "custom_title": "Adopted App task",
             "cwd": str(repo),
             "adopted_from": "codex-app",
         },
@@ -1737,7 +1746,7 @@ def test_closeout_handles_non_git_directory(tmp_path, monkeypatch, capsys):
         "lane-1",
         {
             "codex_thread_id": "thread-1",
-            "title": "Non Git lane",
+            "custom_title": "Non Git lane",
             "cwd": str(workspace),
             "last_status": "completed",
             "goal_status": "complete",
@@ -1855,7 +1864,7 @@ def test_goal_runner_continues_active_goal_until_complete(
         {
             "codex_thread_id": "thread-1",
             "cwd": str(tmp_path),
-            "title": "Goal lane",
+            "custom_title": "Goal lane",
             "sandbox": "workspace-write",
             "commit_signing": {"mode": "off"},
             "goal_status": "active",
@@ -1986,7 +1995,7 @@ def test_goal_runner_timeout_returns_clean_recoverable_state(
         {
             "codex_thread_id": "thread-1",
             "cwd": str(tmp_path),
-            "title": "Goal lane",
+            "custom_title": "Goal lane",
             "sandbox": "workspace-write",
             "commit_signing": {"mode": "off"},
             "goal_status": "active",
@@ -2203,7 +2212,7 @@ def test_session_list_json_includes_unaliased_main_sessions_by_default(
     save_alias(
         "codex",
         "main-lane",
-        {"codex_thread_id": "thread-1", "title": "Main lane"},
+        {"codex_thread_id": "thread-1", "custom_title": "Main lane"},
         tmp_path,
     )
 
@@ -2225,9 +2234,9 @@ def test_session_list_json_includes_unaliased_main_sessions_by_default(
         "Session title",
         "Scratch session",
     ]
-    assert json_output["items"][0]["title"] == "Session title"
-    assert json_output["items"][0]["title_source"] == "codex_title"
-    assert json_output["items"][0]["lane_label"] == "Main lane"
+    assert json_output["items"][0]["lane_title"] == "Main lane"
+    assert json_output["items"][0]["lane_title_source"] == "custom_title"
+    assert json_output["items"][0]["codex_title"] == "Session title"
 
 
 class FakeReadCodex:

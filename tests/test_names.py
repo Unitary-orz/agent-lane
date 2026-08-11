@@ -1,7 +1,7 @@
 import pytest
 
 import agent_lane.control_plane as cli
-from agent_lane.cli import main
+from agent_lane.cli import build_parser, main
 from cli_result import decode_cli_output
 from agent_lane.state import load_alias, save_alias
 from agent_lane.workspace import WorkspaceError
@@ -41,15 +41,24 @@ class FakeNameCodex:
         return None
 
 
-def _seed_alias(tmp_path):
+def _seed_alias(tmp_path, *, custom_title=None, codex_title=None):
+    data = {
+        "codex_thread_id": "thread-1",
+        "title": "Removed legacy title",
+        "title_source": "legacy",
+        "lane_label": "Removed lane label",
+        "lane_title": "Removed computed title",
+        "lane_title_source": "title",
+        "cwd": str(tmp_path),
+    }
+    if custom_title is not None:
+        data["custom_title"] = custom_title
+    if codex_title is not None:
+        data["codex_title"] = codex_title
     save_alias(
         "codex",
         "lane-1",
-        {
-            "codex_thread_id": "thread-1",
-            "title": "Local label",
-            "cwd": str(tmp_path),
-        },
+        data,
         tmp_path,
     )
 
@@ -61,10 +70,10 @@ def _reset_fake(*, name="App title", confirm_set=True):
     FakeNameCodex.init_kwargs = []
 
 
-def test_name_get_uses_codex_as_authoritative_title_and_migrates_alias(
+def test_name_get_uses_codex_title_and_removes_legacy_title_fields(
     tmp_path, monkeypatch, capsys
 ):
-    _seed_alias(tmp_path)
+    _seed_alias(tmp_path, codex_title="App title")
     _reset_fake()
     monkeypatch.setattr(cli, "CodexAppServer", FakeNameCodex)
 
@@ -83,17 +92,21 @@ def test_name_get_uses_codex_as_authoritative_title_and_migrates_alias(
 
     assert rc == 0
     assert FakeNameCodex.init_kwargs == [{"transport": "stdio"}]
-    assert result["title"] == "App title"
-    assert result["title_source"] == "codex_title"
-    assert result["lane_label"] == "Local label"
+    assert result["lane_title"] == "App title"
+    assert result["lane_title_source"] == "codex_title"
+    assert result["custom_title"] is None
     assert result["codex_title_observation"] == "live"
     assert result["binding_generation"] == 1
     assert result["binding_origin"] == "legacy"
     assert result["lineage_complete"] is False
-    assert alias["schema_version"] == 3
+    assert alias["schema_version"] == 4
     assert alias["execution_mode"] == "independent"
-    assert alias["lane_label"] == "Local label"
-    assert alias["title"] == "Local label"
+    assert "lane_label" not in alias
+    assert "title" not in alias
+    assert "title_source" not in alias
+    assert "lane_title" not in alias
+    assert "lane_title_source" not in alias
+    assert "custom_title" not in alias
     assert alias["codex_title"] == "App title"
     assert alias["binding"] == {
         "generation": 1,
@@ -163,7 +176,9 @@ def test_name_get_live_observation_forces_daemon_for_thread_target(
     assert result["observation_mode"] == "live"
 
 
-def test_name_get_falls_back_when_codex_name_is_empty(tmp_path, monkeypatch, capsys):
+def test_name_get_falls_back_to_lane_id_when_codex_name_is_empty(
+    tmp_path, monkeypatch, capsys
+):
     _seed_alias(tmp_path)
     _reset_fake(name=None)
     monkeypatch.setattr(cli, "CodexAppServer", FakeNameCodex)
@@ -183,8 +198,8 @@ def test_name_get_falls_back_when_codex_name_is_empty(tmp_path, monkeypatch, cap
     assert rc == 0
     assert result["codex_title"] is None
     assert result["codex_title_observation"] == "live"
-    assert result["title"] == "Local label"
-    assert result["title_source"] == "lane_label"
+    assert result["lane_title"] == "lane-1"
+    assert result["lane_title_source"] == "lane_id"
 
 
 def test_name_set_checks_optional_precondition_before_remote_write(
@@ -218,7 +233,7 @@ def test_name_set_checks_optional_precondition_before_remote_write(
     assert alias["codex_title"] == "Human rename"
 
 
-def test_name_set_writes_reads_back_and_keeps_local_label(
+def test_name_set_writes_reads_back_and_reports_codex_title(
     tmp_path, monkeypatch, capsys
 ):
     _seed_alias(tmp_path)
@@ -246,10 +261,10 @@ def test_name_set_writes_reads_back_and_keeps_local_label(
     assert FakeNameCodex.set_calls == [("thread-1", "Renamed in Codex")]
     assert result["renamed"] is True
     assert result["previous_codex_title"] == "App title"
-    assert result["title"] == "Renamed in Codex"
-    assert result["title_source"] == "codex_title"
+    assert result["lane_title"] == "Renamed in Codex"
+    assert result["lane_title_source"] == "codex_title"
     assert alias["codex_title"] == "Renamed in Codex"
-    assert alias["lane_label"] == "Local label"
+    assert "custom_title" not in alias
 
 
 def test_name_set_fails_when_readback_does_not_match(
@@ -297,15 +312,162 @@ def test_status_uses_live_codex_title_without_mutating_alias(
             "lane-1",
             "--alias-root",
             str(tmp_path),
+            "--detail",
+            "full",
         ]
     )
     result = decode_cli_output(capsys.readouterr().out)
 
     assert rc == 0
-    assert result["title"] == "Renamed in App"
-    assert result["title_source"] == "codex_title"
+    assert result["lane_title"] == "Renamed in App"
+    assert result["lane_title_source"] == "codex_title"
+    assert result["codex_title_observation"] == "live"
+    assert not {
+        "title",
+        "title_source",
+        "lane_label",
+        "lane_title",
+        "lane_title_source",
+    }.intersection(result["alias"])
+    assert alias_path.read_text(encoding="utf-8") == before
+
+
+def test_name_get_shares_lane_lock_with_custom_title_writes(tmp_path):
+    _seed_alias(tmp_path)
+    name_get = build_parser().parse_args(
+        [
+            "codex",
+            "session",
+            "name",
+            "get",
+            "--lane-id",
+            "lane-1",
+            "--alias-root",
+            str(tmp_path),
+        ]
+    )
+    custom_title_set = build_parser().parse_args(
+        [
+            "codex",
+            "custom-title",
+            "set",
+            "--lane-id",
+            "lane-1",
+            "--alias-root",
+            str(tmp_path),
+            "--title",
+            "Pinned lane title",
+        ]
+    )
+
+    with cli._command_locks(name_get):
+        with pytest.raises(WorkspaceError) as caught:
+            with cli._command_locks(custom_title_set):
+                pass
+
+    assert caught.value.error_code == "LANE_OPERATION_BUSY"
+
+
+def test_status_keeps_explicit_custom_title_over_live_codex_rename(
+    tmp_path, monkeypatch, capsys
+):
+    _seed_alias(tmp_path, custom_title="Pinned lane title")
+    alias_path = tmp_path / "codex" / "lane-1.json"
+    before = alias_path.read_text(encoding="utf-8")
+    _reset_fake(name="Renamed in App")
+    monkeypatch.setattr(cli, "CodexAppServer", FakeNameCodex)
+
+    rc = main(
+        [
+            "codex",
+            "status",
+            "--lane-id",
+            "lane-1",
+            "--alias-root",
+            str(tmp_path),
+        ]
+    )
+    result = decode_cli_output(capsys.readouterr().out)
+
+    assert rc == 0
+    assert result["lane_title"] == "Pinned lane title"
+    assert result["lane_title_source"] == "custom_title"
+    assert result["custom_title"] == "Pinned lane title"
+    assert result["codex_title"] == "Renamed in App"
     assert result["codex_title_observation"] == "live"
     assert alias_path.read_text(encoding="utf-8") == before
+
+
+def test_custom_title_set_get_and_clear_override_codex_title(
+    tmp_path, monkeypatch, capsys
+):
+    _seed_alias(tmp_path, codex_title="App title")
+    _reset_fake()
+    monkeypatch.setattr(cli, "CodexAppServer", FakeNameCodex)
+
+    set_rc = main(
+        [
+            "codex",
+            "custom-title",
+            "set",
+            "--lane-id",
+            "lane-1",
+            "--alias-root",
+            str(tmp_path),
+            "--title",
+            "Pinned lane title",
+        ]
+    )
+    set_result = decode_cli_output(capsys.readouterr().out)
+    alias = load_alias("codex", "lane-1", tmp_path)
+
+    assert set_rc == 0
+    assert set_result["lane_title"] == "Pinned lane title"
+    assert set_result["lane_title_source"] == "custom_title"
+    assert set_result["custom_title"] == "Pinned lane title"
+    assert set_result["codex_title"] == "App title"
+    assert alias["custom_title"] == "Pinned lane title"
+    assert "title" not in alias
+    assert "lane_label" not in alias
+    assert FakeNameCodex.set_calls == []
+
+    get_rc = main(
+        [
+            "codex",
+            "custom-title",
+            "get",
+            "--lane-id",
+            "lane-1",
+            "--alias-root",
+            str(tmp_path),
+        ]
+    )
+    get_result = decode_cli_output(capsys.readouterr().out)
+
+    assert get_rc == 0
+    assert get_result["lane_title"] == "Pinned lane title"
+    assert get_result["lane_title_source"] == "custom_title"
+
+    clear_rc = main(
+        [
+            "codex",
+            "custom-title",
+            "clear",
+            "--lane-id",
+            "lane-1",
+            "--alias-root",
+            str(tmp_path),
+        ]
+    )
+    clear_result = decode_cli_output(capsys.readouterr().out)
+    alias = load_alias("codex", "lane-1", tmp_path)
+
+    assert clear_rc == 0
+    assert clear_result["cleared"] is True
+    assert clear_result["custom_title"] is None
+    assert clear_result["lane_title"] == "App title"
+    assert clear_result["lane_title_source"] == "codex_title"
+    assert "custom_title" not in alias
 
 
 def test_codex_alias_save_rejects_mismatched_binding(tmp_path):

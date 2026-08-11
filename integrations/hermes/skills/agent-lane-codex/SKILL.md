@@ -1,7 +1,7 @@
 ---
 name: agent-lane-codex
 description: "Use agent-lane to start, inspect, continue, steer, and close out durable Codex coding tasks, including optional App Sync."
-version: 1.0.0-rc.2
+version: 1.0.0-rc.3
 author: Unitary-orz
 license: MIT
 platforms: [macos]
@@ -111,6 +111,8 @@ agent-lane codex run \
 ```
 
 When no target is supplied, agent-lane generates the internal stable lane ID.
+`--title` is an explicit `custom_title` override and seeds the initial Codex
+task name. Without it, `lane_title` follows the latest observed `codex_title`.
 Use the returned thread ID or another exact selector for later calls. Automation
 may still supply and reuse `--lane-id`. Use `--prompt-file` for long or
 carefully quoted instructions.
@@ -148,7 +150,8 @@ by discovery or an earlier result. The other selectors are:
 --lane-id <internal-stable-id>
 ```
 
-Title matching is exact and case-insensitive. `--current` means the only
+`--target-title` matches `custom_title` or `codex_title` exactly and
+case-insensitively. `--current` means the only
 attached task whose stored workspace equals the current process directory; it
 does not mean the most recent task. Treat `CODEX_TARGET_AMBIGUOUS` as a required
 selection step and choose only from `choices[].target_argv`. Never guess among
@@ -236,6 +239,10 @@ exact thread target.
 Use `session name get/set` to read or change the task name. Do not infer that a
 name observed in one store has been written to another; live read-back is an
 explicit operation.
+
+Use `custom-title get/set/clear` for the explicit local override. It never
+renames the Codex task. Read `lane_title` and `lane_title_source` as the resolved
+display value instead of reconstructing precedence in the caller.
 
 ## Persistent goals
 

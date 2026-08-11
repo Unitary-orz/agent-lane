@@ -74,7 +74,10 @@ agent-lane codex run \
 
 The response is one JSON envelope. Retain its exact thread target and internal
 `lane_id` as machine state; the human does not need to create or remember the
-lane ID. Do not treat an observation timeout as cancellation.
+lane ID. `--title` creates an explicit `custom_title`; omit it when the lane
+should keep following the latest observed Codex task name. Read the resolved
+`lane_title` from later results. Do not treat an observation timeout as
+cancellation.
 
 ## 4. Observe proportionally
 
@@ -138,7 +141,7 @@ that reported tests are relevant, and that no unrelated changes were included.
 
 Give the user:
 
-- the task title and exact thread target;
+- the resolved `lane_title` and exact thread target;
 - outcome and changed artifacts;
 - exact validation performed;
 - remaining risks or blockers;

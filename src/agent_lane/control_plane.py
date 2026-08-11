@@ -65,7 +65,16 @@ from .workspace import (
 )
 
 CODEX_PROVIDER = "codex"
-CODEX_ALIAS_SCHEMA_VERSION = 3
+CODEX_ALIAS_SCHEMA_VERSION = 4
+REMOVED_CODEX_TITLE_FIELDS = frozenset(
+    {
+        "title",
+        "title_source",
+        "lane_label",
+        "lane_title",
+        "lane_title_source",
+    }
+)
 EXECUTION_MODES = ("independent", "app-sync")
 COMMIT_SIGNING_MODES = ("off", "agent")
 SENSITIVE_CONFIG_KEY_PARTS = frozenset(
@@ -101,6 +110,10 @@ LANE_TARGET_HANDLERS = frozenset(
         "codex.wait",
         "codex.watch",
         "codex.checkpoint",
+        "codex.custom-title.get",
+        "codex.custom-title.set",
+        "codex.custom-title.clear",
+        "codex.session.name.get",
         "codex.session.name.set",
         "codex.goal.set",
         "codex.goal.run",
@@ -118,6 +131,7 @@ READ_ONLY_UNBOUND_TARGET_HANDLERS = frozenset(
         "codex.watch",
         "codex.checkpoint",
         "codex.goal.get",
+        "codex.session.name.get",
     }
 )
 
@@ -279,7 +293,10 @@ def _command_locks(args: argparse.Namespace) -> ExitStack:
             "codex.send",
             "codex.cleanup",
             "codex.session.attach",
+            "codex.session.name.get",
             "codex.session.name.set",
+            "codex.custom-title.set",
+            "codex.custom-title.clear",
             "codex.goal.set",
             "codex.goal.run",
             "codex.goal.complete",
@@ -327,12 +344,6 @@ def _prepare_command_target(args: argparse.Namespace) -> None:
             return
         lane_id = _new_internal_lane_id(alias_root)
         args.lane_id = lane_id
-        if _nonempty_text(getattr(args, "title", None)) is None:
-            raw_cwd = _nonempty_text(getattr(args, "cwd", None))
-            if raw_cwd is not None:
-                default_title = Path(raw_cwd).expanduser().name
-                if default_title:
-                    args.title = default_title
         args._target_resolution = {
             "requested": {"kind": "new", "value": None},
             "source": "generated_internal",
@@ -512,8 +523,7 @@ def _target_alias_matches(
                 title.casefold()
                 for title in (
                     _nonempty_text(alias.get("codex_title")),
-                    _nonempty_text(alias.get("lane_label")),
-                    _nonempty_text(alias.get("title")),
+                    _nonempty_text(alias.get("custom_title")),
                 )
                 if title is not None
             }
@@ -555,7 +565,7 @@ def _target_alias_registry(
 
     aliases: list[dict[str, Any]] = []
     for raw in items:
-        alias = dict(raw)
+        alias = _project_codex_alias(raw)
         if _nonempty_text(alias.get("lane_id")) is None:
             raw_path = _nonempty_text(alias.get("_path"))
             if raw_path is not None:
@@ -569,7 +579,8 @@ def _load_target_alias(
     lane_id: str,
 ) -> dict[str, Any] | None:
     try:
-        return load_alias(CODEX_PROVIDER, lane_id, alias_root)
+        alias = load_alias(CODEX_PROVIDER, lane_id, alias_root)
+        return _project_codex_alias(alias) if alias is not None else None
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise WorkspaceError(
             "CODEX_TARGET_REGISTRY_INVALID",
@@ -600,7 +611,9 @@ def _target_choice(
     return {
         "lane_id": lane_id,
         "thread_id": thread_id,
-        "title": _title_contract(alias, lane_id=lane_id)["title"],
+        "lane_title": _title_contract(alias, lane_id=lane_id)[
+            "lane_title"
+        ],
         "target_argv": target_argv,
     }
 
@@ -685,8 +698,17 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
     goal_objective = _normalize_goal_objective(
         getattr(args, "goal_objective", None)
     )
+    requested_custom_title = _nonempty_text(getattr(args, "title", None))
+    if getattr(args, "title", None) is not None and requested_custom_title is None:
+        raise WorkspaceError(
+            "LANE_CUSTOM_TITLE_INVALID",
+            "--title requires a non-empty value",
+            lane_id=args.lane_id,
+            retryable=False,
+        )
     alias_root = Path(args.alias_root).expanduser()
     existing = load_alias(CODEX_PROVIDER, args.lane_id, alias_root)
+    initial_title_cwd = _resolve_cwd(args.cwd, existing)
     execution_mode, resolved_mode_source = _resolve_execution_mode(
         getattr(args, "mode", None),
         existing,
@@ -706,11 +728,19 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
         existing,
         alias_root,
     )
-    lane_label = args.title or _lane_label(existing or {}, lane_id=args.lane_id)
-    title = (
-        _title_contract(existing or {}, lane_id=args.lane_id)["title"]
+    custom_title = (
+        requested_custom_title
+        if getattr(args, "title", None) is not None
+        else _custom_title(existing or {})
+    )
+    codex_title = (
+        _stored_codex_title(existing or {})
         if existing and existing.get("codex_thread_id")
-        else lane_label
+        else _new_codex_title(
+            requested_title=custom_title,
+            cwd=initial_title_cwd,
+            lane_id=args.lane_id,
+        )
     ) or args.lane_id
     sandbox = _resolve_sandbox(args.sandbox, existing)
     request_echo = _resolve_turn_request(args, existing)
@@ -792,10 +822,7 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                     raise
             else:
                 _update_thread_alias(alias, snapshot.get("thread") or {})
-                title = str(
-                    _title_contract(alias, lane_id=args.lane_id)["title"]
-                    or args.lane_id
-                )
+                codex_title = _stored_codex_title(alias) or args.lane_id
                 _require_thread_inactive_for_turn(
                     snapshot.get("thread") or {},
                     lane_id=args.lane_id,
@@ -810,8 +837,8 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                     model=model,
                     runtime_workspace_roots=workspace_roots,
                 )
-                codex.set_thread_name(thread_id, title)
-                written_codex_title = title
+                codex.set_thread_name(thread_id, codex_title)
+                written_codex_title = codex_title
                 codex.update_git_info(thread_id, _git_info(cwd))
                 additional_context = _workspace_rebind_additional_context(
                     alias,
@@ -846,7 +873,7 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                     alias=alias,
                     thread_id=thread_id,
                     cwd=cwd,
-                    title=title,
+                    title=codex_title,
                     sandbox=sandbox,
                     model=model,
                     workspace_roots=workspace_roots,
@@ -863,8 +890,7 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                     resumed = False
                     thread_replacement = prepared_thread
                     additional_context = prepared_thread["additional_context"]
-                    title = str(prepared_thread["title"])
-                    lane_label = _lane_label(alias, lane_id=args.lane_id)
+                    codex_title = str(prepared_thread["codex_title"])
                     candidate = prepared_thread.get("goal")
                     replacement_goal = (
                         candidate if isinstance(candidate, dict) else None
@@ -878,8 +904,8 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                 model=model,
                 runtime_workspace_roots=workspace_roots,
             )
-            codex.set_thread_name(thread_id, title)
-            written_codex_title = title
+            codex.set_thread_name(thread_id, codex_title)
+            written_codex_title = codex_title
             codex.update_git_info(thread_id, _git_info(cwd))
             if (
                 getattr(codex, "transport", "stdio") == "daemon"
@@ -898,8 +924,6 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                 "codex_thread_id": thread_id,
                 "codex_url": f"codex://threads/{thread_id}",
                 "cwd": cwd,
-                "title": lane_label or args.lane_id,
-                "lane_label": lane_label or args.lane_id,
                 "sandbox": sandbox,
                 "model": model,
                 **request_echo,
@@ -909,6 +933,10 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                 "created_at": alias.get("created_at") or now,
             }
         )
+        if custom_title is None:
+            alias.pop("custom_title", None)
+        else:
+            alias["custom_title"] = custom_title
         if not isinstance(alias.get("binding"), dict):
             _initialize_codex_binding(
                 alias,
@@ -979,7 +1007,7 @@ def cmd_codex_run(args: argparse.Namespace) -> dict[str, Any]:
                 alias.pop("goal_refresh_error", None)
             except Exception as exc:
                 alias["goal_refresh_error"] = str(exc)
-    _update_turn_alias(alias, args.lane_id, thread_id, cwd, title, sandbox, turn)
+    _update_turn_alias(alias, args.lane_id, thread_id, cwd, sandbox, turn)
     if goal_tracking:
         _update_goal_alias(alias, goal)
     runner = _runner_state(
@@ -1236,9 +1264,7 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
         existing.get("execution_mode_source") or resolved_mode_source
     )
     prompt = _read_prompt(args)
-    title = str(
-        _title_contract(existing, lane_id=args.lane_id)["title"] or args.lane_id
-    )
+    codex_title = _stored_codex_title(existing) or args.lane_id
     sandbox = _resolve_sandbox(args.sandbox, existing)
     request_echo = _resolve_turn_request(args, existing)
     model = request_echo["requested_model"]
@@ -1271,9 +1297,7 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
         )
         _sync_adopted_thread_cwd(alias, thread.get("thread") or {})
         _update_thread_alias(alias, thread.get("thread") or {})
-        title = str(
-            _title_contract(alias, lane_id=args.lane_id)["title"] or args.lane_id
-        )
+        codex_title = _stored_codex_title(alias) or args.lane_id
         cwd = _resolve_cwd(None, alias)
         workspace_roots = _runtime_workspace_roots(cwd, add_dirs)
         prepared_thread = _prepare_existing_thread_for_turn(
@@ -1281,7 +1305,7 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
             alias=alias,
             thread_id=thread_id,
             cwd=cwd,
-            title=title,
+            title=codex_title,
             sandbox=sandbox,
             model=model,
             workspace_roots=workspace_roots,
@@ -1297,7 +1321,7 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
         if prepared_thread["replaced"]:
             thread_replacement = prepared_thread
             additional_context = prepared_thread["additional_context"]
-            title = str(prepared_thread["title"])
+            codex_title = str(prepared_thread["codex_title"])
         alias.update(
             {
                 "model": model,
@@ -1343,7 +1367,6 @@ def _cmd_codex_send_lane(args: argparse.Namespace) -> dict[str, Any]:
             args.lane_id,
             thread_id,
             cwd,
-            title,
             sandbox,
             turn,
         )
@@ -1789,12 +1812,12 @@ def _status_brief(
         **{
             key: status.get(key)
             for key in (
-                "title",
-                "title_source",
+                "lane_title",
+                "lane_title_source",
                 "codex_title",
                 "codex_title_observation",
                 "codex_title_observed_at",
-                "lane_label",
+                "custom_title",
             )
         },
         "cwd": cwd,
@@ -2454,6 +2477,14 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
     thread_id = str(args.thread_id).strip()
     if not thread_id:
         raise ValueError("--thread-id requires a non-empty value")
+    requested_custom_title = _nonempty_text(getattr(args, "title", None))
+    if getattr(args, "title", None) is not None and requested_custom_title is None:
+        raise WorkspaceError(
+            "LANE_CUSTOM_TITLE_INVALID",
+            "--title requires a non-empty value",
+            lane_id=args.lane_id,
+            retryable=False,
+        )
 
     existing = load_alias(CODEX_PROVIDER, args.lane_id, alias_root)
     requested_mode = getattr(args, "mode", None)
@@ -2503,9 +2534,8 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
                 alias["cwd"] = cwd
                 alias["workspace"] = _workspace_status(cwd, None)
         _update_thread_alias(alias, thread)
-        if args.title:
-            alias["lane_label"] = args.title
-            alias["title"] = args.title
+        if getattr(args, "title", None) is not None:
+            alias["custom_title"] = requested_custom_title
         if args.sandbox:
             alias["sandbox"] = _resolve_sandbox(args.sandbox, alias)
         _record_execution_mode(
@@ -2554,7 +2584,6 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
 
     now = time.time()
     alias: dict[str, Any] = {}
-    lane_label = args.title or thread.get("preview") or args.lane_id
     sandbox = _resolve_sandbox(args.sandbox, alias)
     git = _git_snapshot(cwd, include_details=False)
     workspace = workspace_snapshot(
@@ -2588,8 +2617,8 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
         source=execution_mode_source,
     )
     _update_thread_alias(alias, thread)
-    alias["lane_label"] = lane_label
-    alias["title"] = lane_label
+    if requested_custom_title is not None:
+        alias["custom_title"] = requested_custom_title
     path = save_alias(CODEX_PROVIDER, args.lane_id, alias, alias_root)
     return {
         "ok": True,
@@ -2734,6 +2763,72 @@ def cmd_codex_name_set(args: argparse.Namespace) -> dict[str, Any]:
         "binding": alias.get("binding"),
         "renamed": observed_title != requested_title,
         "previous_codex_title": observed_title,
+    }
+
+
+def cmd_codex_custom_title_get(args: argparse.Namespace) -> dict[str, Any]:
+    alias_root = Path(args.alias_root).expanduser()
+    alias = dict(_require_command_alias(args, alias_root))
+    thread_id = str(alias["codex_thread_id"])
+    return {
+        "ok": True,
+        "provider": CODEX_PROVIDER,
+        "lane_id": args.lane_id,
+        "codex_thread_id": thread_id,
+        "codex_url": f"codex://threads/{thread_id}",
+        "alias_path": str(alias_path(CODEX_PROVIDER, args.lane_id, alias_root)),
+        **_title_contract(alias, lane_id=args.lane_id),
+        **_binding_contract(alias),
+    }
+
+
+def cmd_codex_custom_title_set(args: argparse.Namespace) -> dict[str, Any]:
+    requested_title = _nonempty_text(args.title)
+    if requested_title is None:
+        raise WorkspaceError(
+            "LANE_CUSTOM_TITLE_INVALID",
+            "--title requires a non-empty value",
+            lane_id=args.lane_id,
+            retryable=False,
+        )
+    alias_root = Path(args.alias_root).expanduser()
+    alias = dict(_require_command_alias(args, alias_root))
+    previous_title = _custom_title(alias)
+    alias["custom_title"] = requested_title
+    path = save_alias(CODEX_PROVIDER, args.lane_id, alias, alias_root)
+    thread_id = str(alias["codex_thread_id"])
+    return {
+        "ok": True,
+        "provider": CODEX_PROVIDER,
+        "lane_id": args.lane_id,
+        "codex_thread_id": thread_id,
+        "codex_url": f"codex://threads/{thread_id}",
+        "alias_path": str(path),
+        **_title_contract(alias, lane_id=args.lane_id),
+        **_binding_contract(alias),
+        "updated": previous_title != requested_title,
+        "previous_custom_title": previous_title,
+    }
+
+
+def cmd_codex_custom_title_clear(args: argparse.Namespace) -> dict[str, Any]:
+    alias_root = Path(args.alias_root).expanduser()
+    alias = dict(_require_command_alias(args, alias_root))
+    previous_title = _custom_title(alias)
+    alias.pop("custom_title", None)
+    path = save_alias(CODEX_PROVIDER, args.lane_id, alias, alias_root)
+    thread_id = str(alias["codex_thread_id"])
+    return {
+        "ok": True,
+        "provider": CODEX_PROVIDER,
+        "lane_id": args.lane_id,
+        "codex_thread_id": thread_id,
+        "codex_url": f"codex://threads/{thread_id}",
+        "alias_path": str(path),
+        **_title_contract(alias, lane_id=args.lane_id),
+        **_binding_contract(alias),
+        "cleared": previous_title is not None,
+        "previous_custom_title": previous_title,
     }
 
 
@@ -3045,6 +3140,14 @@ def _select_turn(
 
 
 def cmd_codex_goal_set(args: argparse.Namespace) -> dict[str, Any]:
+    requested_custom_title = _nonempty_text(getattr(args, "title", None))
+    if getattr(args, "title", None) is not None and requested_custom_title is None:
+        raise WorkspaceError(
+            "LANE_CUSTOM_TITLE_INVALID",
+            "--title requires a non-empty value",
+            lane_id=args.lane_id,
+            retryable=False,
+        )
     alias_root = Path(args.alias_root).expanduser()
     existing = load_alias(CODEX_PROVIDER, args.lane_id, alias_root)
     execution_mode, resolved_mode_source = _resolve_execution_mode(None, existing)
@@ -3054,11 +3157,19 @@ def cmd_codex_goal_set(args: argparse.Namespace) -> dict[str, Any]:
     if existing is not None:
         _refresh_adopted_alias_cwd(existing, args.lane_id, alias_root)
     cwd = _resolve_cwd(args.cwd, existing)
-    lane_label = args.title or _lane_label(existing or {}, lane_id=args.lane_id)
-    title = (
-        _title_contract(existing or {}, lane_id=args.lane_id)["title"]
+    custom_title = (
+        requested_custom_title
+        if getattr(args, "title", None) is not None
+        else _custom_title(existing or {})
+    )
+    codex_title = (
+        _stored_codex_title(existing or {})
         if existing and existing.get("codex_thread_id")
-        else lane_label
+        else _new_codex_title(
+            requested_title=custom_title,
+            cwd=cwd,
+            lane_id=args.lane_id,
+        )
     ) or args.lane_id
     sandbox = _resolve_sandbox(args.sandbox, existing)
     commit_signing_mode = _resolve_commit_signing(args.commit_signing, existing)
@@ -3075,17 +3186,14 @@ def cmd_codex_goal_set(args: argparse.Namespace) -> dict[str, Any]:
             thread_id = str(existing["codex_thread_id"])
             snapshot = codex.read_thread(thread_id, include_turns=False)
             _update_thread_alias(existing, snapshot.get("thread") or {})
-            title = str(
-                _title_contract(existing, lane_id=args.lane_id)["title"]
-                or args.lane_id
-            )
+            codex_title = _stored_codex_title(existing) or args.lane_id
             codex.resume_thread(thread_id, cwd=cwd, sandbox=sandbox)
         else:
             if not cwd:
                 raise ValueError("--cwd is required when creating a new goal lane")
             thread_id = codex.start_thread(cwd, sandbox=sandbox)
-            codex.set_thread_name(thread_id, title)
-            written_codex_title = title
+            codex.set_thread_name(thread_id, codex_title)
+            written_codex_title = codex_title
             codex.update_git_info(thread_id, _git_info(cwd))
         result = codex.set_goal(
             thread_id,
@@ -3103,8 +3211,6 @@ def cmd_codex_goal_set(args: argparse.Namespace) -> dict[str, Any]:
             "codex_thread_id": thread_id,
             "codex_url": f"codex://threads/{thread_id}",
             "cwd": cwd,
-            "title": lane_label or args.lane_id,
-            "lane_label": lane_label or args.lane_id,
             "sandbox": sandbox,
             "commit_signing": commit_signing["metadata"],
             "mode": "goal",
@@ -3112,6 +3218,10 @@ def cmd_codex_goal_set(args: argparse.Namespace) -> dict[str, Any]:
             "created_at": alias.get("created_at") or now,
         }
     )
+    if custom_title is None:
+        alias.pop("custom_title", None)
+    else:
+        alias["custom_title"] = custom_title
     if not isinstance(alias.get("binding"), dict):
         _initialize_codex_binding(
             alias,
@@ -3169,9 +3279,7 @@ def cmd_codex_goal_run(args: argparse.Namespace) -> dict[str, Any]:
     )
     _refresh_adopted_alias_cwd(existing, args.lane_id, alias_root)
     cwd = _resolve_cwd(None, existing)
-    title = str(
-        _title_contract(existing, lane_id=args.lane_id)["title"] or args.lane_id
-    )
+    codex_title = _stored_codex_title(existing) or args.lane_id
     sandbox = _resolve_sandbox(args.sandbox, existing)
     request_echo = _resolve_turn_request(args, existing)
     model = request_echo["requested_model"]
@@ -3309,9 +3417,7 @@ def cmd_codex_goal_run(args: argparse.Namespace) -> dict[str, Any]:
         app_server_transport = getattr(codex, "transport", "stdio")
         snapshot = codex.read_thread(thread_id, include_turns=False)
         _update_thread_alias(alias, snapshot.get("thread") or {})
-        title = str(
-            _title_contract(alias, lane_id=args.lane_id)["title"] or args.lane_id
-        )
+        codex_title = _stored_codex_title(alias) or args.lane_id
         _require_thread_inactive_for_turn(
             snapshot.get("thread") or {},
             lane_id=args.lane_id,
@@ -3338,7 +3444,7 @@ def cmd_codex_goal_run(args: argparse.Namespace) -> dict[str, Any]:
             alias=alias,
             thread_id=thread_id,
             cwd=cwd,
-            title=title,
+            title=codex_title,
             sandbox=sandbox,
             model=model,
             workspace_roots=workspace_roots,
@@ -3354,7 +3460,7 @@ def cmd_codex_goal_run(args: argparse.Namespace) -> dict[str, Any]:
         if prepared_thread["replaced"]:
             thread_replacement = prepared_thread
             additional_context = prepared_thread["additional_context"]
-            title = str(prepared_thread["title"])
+            codex_title = str(prepared_thread["codex_title"])
             candidate = prepared_thread.get("goal")
             goal = candidate if isinstance(candidate, dict) else None
         alias.update(
@@ -3484,7 +3590,6 @@ def cmd_codex_goal_run(args: argparse.Namespace) -> dict[str, Any]:
                 args.lane_id,
                 thread_id,
                 cwd,
-                title,
                 sandbox,
                 turn,
             )
@@ -4467,10 +4572,12 @@ def _resolve_run_workspace(
     existing = {
         "lane_id": args.lane_id,
         "cwd": cwd,
-        "title": args.title or args.lane_id,
         "workspace": workspace,
         "created_at": time.time(),
     }
+    requested_custom_title = _nonempty_text(getattr(args, "title", None))
+    if requested_custom_title is not None:
+        existing["custom_title"] = requested_custom_title
     save_alias(CODEX_PROVIDER, args.lane_id, existing, alias_root)
     return cwd, existing, workspace
 
@@ -5391,7 +5498,7 @@ def _replace_thread_for_agent_signing(
     lane_id: str,
     alias_root: Path,
 ) -> dict[str, Any]:
-    logical_title, replacement_title = _signing_replacement_titles(title)
+    _, replacement_title = _signing_replacement_titles(title)
     if not allow_signing_replacement:
         raise WorkspaceError(
             "CODEX_SIGNING_REPLACEMENT_AUTHORIZATION_REQUIRED",
@@ -5481,8 +5588,6 @@ def _replace_thread_for_agent_signing(
             {
                 "codex_thread_id": thread_id,
                 "codex_url": f"codex://threads/{thread_id}",
-                "title": logical_title,
-                "lane_label": logical_title,
                 "commit_signing": commit_signing["metadata"],
                 "origin_codex_thread_id": (
                     alias.get("origin_codex_thread_id") or origin_thread_id
@@ -5555,7 +5660,7 @@ def _replace_thread_for_agent_signing(
         "replaced": True,
         "reason": "loaded_thread_resume_config_not_effective",
         "origin_thread_id": origin_thread_id,
-        "title": logical_title,
+        "codex_title": replacement_title,
         "additional_context": additional_context,
         "goal": replacement_goal,
     }
@@ -5698,7 +5803,7 @@ def _require_alias(lane_id: str, alias_root: Path) -> dict[str, Any]:
             },
             retryable=False,
         )
-    return alias
+    return _project_codex_alias(alias)
 
 
 def _require_alias_identity(
@@ -5744,12 +5849,35 @@ def _nonempty_text(value: Any) -> str | None:
     return text or None
 
 
-def _lane_label(alias: dict[str, Any], *, lane_id: str | None = None) -> str | None:
-    return (
-        _nonempty_text(alias.get("lane_label"))
-        or _nonempty_text(alias.get("title"))
-        or _nonempty_text(lane_id)
-    )
+def _project_codex_alias(alias: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(alias)
+    for field in REMOVED_CODEX_TITLE_FIELDS:
+        projected.pop(field, None)
+    return projected
+
+
+def _custom_title(alias: dict[str, Any]) -> str | None:
+    return _nonempty_text(alias.get("custom_title"))
+
+
+def _stored_codex_title(alias: dict[str, Any]) -> str | None:
+    return _nonempty_text(alias.get("codex_title"))
+
+
+def _new_codex_title(
+    *,
+    requested_title: str | None,
+    cwd: str | None,
+    lane_id: str,
+) -> str:
+    explicit = _nonempty_text(requested_title)
+    if explicit is not None:
+        return explicit
+    if cwd:
+        cwd_name = Path(cwd).expanduser().name
+        if cwd_name:
+            return cwd_name
+    return lane_id
 
 
 def _title_contract(
@@ -5765,17 +5893,17 @@ def _title_contract(
         else alias.get("codex_title")
     )
     codex_title = _nonempty_text(raw_codex_title)
-    lane_label = _lane_label(alias, lane_id=lane_id or alias.get("lane_id"))
+    custom_title = _custom_title(alias)
     resolved_lane_id = _nonempty_text(lane_id or alias.get("lane_id"))
-    if codex_title is not None:
-        display_title = codex_title
-        title_source = "codex_title"
-    elif lane_label is not None:
-        display_title = lane_label
-        title_source = "lane_label"
+    if custom_title is not None:
+        lane_title = custom_title
+        lane_title_source = "custom_title"
+    elif codex_title is not None:
+        lane_title = codex_title
+        lane_title_source = "codex_title"
     else:
-        display_title = resolved_lane_id
-        title_source = "lane_id"
+        lane_title = resolved_lane_id
+        lane_title_source = "lane_id"
     if live_name_present:
         observation = "live"
     elif "codex_title" in alias:
@@ -5783,12 +5911,12 @@ def _title_contract(
     else:
         observation = "unknown"
     return {
-        "title": display_title,
-        "title_source": title_source,
+        "lane_title": lane_title,
+        "lane_title_source": lane_title_source,
         "codex_title": codex_title,
         "codex_title_observation": observation,
         "codex_title_observed_at": alias.get("codex_title_observed_at"),
-        "lane_label": lane_label,
+        "custom_title": custom_title,
     }
 
 
@@ -5895,11 +6023,13 @@ def _advance_codex_binding(
 
 def _prepare_codex_alias_for_save(alias: dict[str, Any], *, lane_id: str) -> None:
     alias["schema_version"] = CODEX_ALIAS_SCHEMA_VERSION
-    label = _lane_label(alias, lane_id=lane_id)
-    if label is not None:
-        alias["lane_label"] = label
-        # Compatibility field: local fallback label, never Codex title authority.
-        alias["title"] = label
+    for field in REMOVED_CODEX_TITLE_FIELDS:
+        alias.pop(field, None)
+    custom_title = _custom_title(alias)
+    if custom_title is None:
+        alias.pop("custom_title", None)
+    else:
+        alias["custom_title"] = custom_title
     thread_id = _nonempty_text(alias.get("codex_thread_id"))
     if thread_id is None:
         return
@@ -5959,20 +6089,16 @@ def _update_turn_alias(
     lane_id: str,
     thread_id: str,
     cwd: str | None,
-    title: str,
     sandbox: str | None,
     turn: Any,
 ) -> None:
     _preserve_legacy_completed_final(alias)
-    label = _lane_label(alias, lane_id=lane_id) or _nonempty_text(title) or lane_id
     alias.update(
         {
             "lane_id": lane_id,
             "codex_thread_id": thread_id,
             "codex_url": f"codex://threads/{thread_id}",
             "cwd": cwd,
-            "title": label,
-            "lane_label": label,
             "sandbox": sandbox,
             "current_turn_id": None,
             "last_turn_id": turn.turn_id,
@@ -6053,7 +6179,12 @@ def _record_written_codex_title(
 
 
 def _sorted_aliases(alias_root: Path) -> list[dict[str, Any]]:
-    return _sort_aliases(list_aliases(CODEX_PROVIDER, alias_root))
+    return _sort_aliases(
+        [
+            _project_codex_alias(alias)
+            for alias in list_aliases(CODEX_PROVIDER, alias_root)
+        ]
+    )
 
 
 def _sort_aliases(aliases: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6071,7 +6202,8 @@ def _sort_aliases(aliases: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _alias_by_thread_id(alias_root: Path) -> dict[str, dict[str, Any]]:
     aliases: dict[str, dict[str, Any]] = {}
-    for alias in list_aliases(CODEX_PROVIDER, alias_root):
+    for raw in list_aliases(CODEX_PROVIDER, alias_root):
+        alias = _project_codex_alias(raw)
         thread_id = alias.get("codex_thread_id")
         if thread_id:
             aliases[str(thread_id)] = alias
@@ -6088,16 +6220,32 @@ def _refresh_aliases_from_codex(
     codex, _transport = _open_read_only_codex(observe)
     with codex:
         for alias in aliases:
-            thread_id = alias.get("codex_thread_id")
+            item = _project_codex_alias(alias)
+            thread_id = item.get("codex_thread_id")
             if not thread_id:
-                refreshed.append(alias)
+                refreshed.append(item)
                 continue
-            item = dict(alias)
             try:
                 thread = codex.read_thread(str(thread_id), include_turns=False)
-                _sync_adopted_thread_cwd(item, thread.get("thread") or {})
-                _update_thread_alias(item, thread.get("thread") or {})
-                save_alias(CODEX_PROVIDER, str(item.get("lane_id")), item, alias_root)
+                lane_id = str(item.get("lane_id") or "")
+                with operation_lock(alias_root, lane_id):
+                    current = load_alias(CODEX_PROVIDER, lane_id, alias_root)
+                    item = _project_codex_alias(current or item)
+                    observed_thread_id = _nonempty_text(
+                        item.get("codex_thread_id")
+                    )
+                    if observed_thread_id != str(thread_id):
+                        raise WorkspaceError(
+                            "CODEX_TARGET_CHANGED",
+                            "the task binding changed while refreshing the lane",
+                            lane_id=lane_id,
+                            expected_thread_id=str(thread_id),
+                            observed_thread_id=observed_thread_id,
+                            retryable=False,
+                        )
+                    _sync_adopted_thread_cwd(item, thread.get("thread") or {})
+                    _update_thread_alias(item, thread.get("thread") or {})
+                    save_alias(CODEX_PROVIDER, lane_id, item, alias_root)
             except Exception as exc:
                 item["refresh_error"] = str(exc)
             refreshed.append(item)
@@ -6186,9 +6334,9 @@ def _thread_outline(
         thread=thread,
         lane_id=(alias or {}).get("lane_id"),
     )
-    if title_fields["title"] is None:
-        title_fields["title"] = thread.get("preview")
-        title_fields["title_source"] = "thread_preview"
+    if title_fields["lane_title"] is None:
+        title_fields["lane_title"] = thread.get("preview")
+        title_fields["lane_title_source"] = "thread_preview"
     return {
         "ok": True,
         "provider": CODEX_PROVIDER,
@@ -6534,7 +6682,7 @@ def _merge_completed_rollout_sessions(
         summaries[thread_id] = _thread_summary(
             {
                 "id": thread_id,
-                "name": alias.get("codex_title") or alias.get("title"),
+                "name": alias.get("codex_title"),
                 "preview": alias.get("codex_preview"),
                 "cwd": alias.get("cwd"),
                 "recencyAt": alias.get("codex_recency_at"),
@@ -6849,7 +6997,7 @@ def _merge_active_goal_sessions(
         if not thread:
             thread = {
                 "id": thread_id,
-                "name": alias.get("codex_title") or alias.get("title"),
+                "name": alias.get("codex_title"),
                 "preview": alias.get("codex_preview"),
                 "cwd": alias.get("cwd"),
                 "recencyAt": alias.get("codex_recency_at"),
@@ -7412,9 +7560,9 @@ def _thread_summary(
         thread=item,
         lane_id=(alias or {}).get("lane_id"),
     )
-    if title_fields["title"] is None:
-        title_fields["title"] = item.get("preview")
-        title_fields["title_source"] = "thread_preview"
+    if title_fields["lane_title"] is None:
+        title_fields["lane_title"] = item.get("preview")
+        title_fields["lane_title_source"] = "thread_preview"
     summary: dict[str, Any] = {
         "kind": "codex_thread",
         "aliased": alias is not None,
@@ -7459,8 +7607,6 @@ def _thread_summary(
         summary.update(
             {
                 "lane_id": alias.get("lane_id"),
-                "lane_label": _lane_label(alias),
-                "lane_title": _lane_label(alias),
                 "last_status": alias.get("last_status"),
                 "local_runner_status": runner["local_status"],
                 "runner_alive": runner["alive"],
@@ -7518,8 +7664,7 @@ def _matches_alias(item: dict[str, Any], query: str) -> bool:
         str(item.get(key) or "")
         for key in (
             "lane_id",
-            "title",
-            "lane_label",
+            "custom_title",
             "codex_title",
             "cwd",
             "codex_thread_id",

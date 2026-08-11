@@ -10,8 +10,8 @@ V1 supports Codex as its first coding agent.
 [Architecture](https://github.com/Unitary-orz/agent-lane/blob/main/docs/architecture.md) ·
 [Changelog](https://github.com/Unitary-orz/agent-lane/blob/main/CHANGELOG.md)
 
-> Current version: `1.0.0-rc.2`. Python packaging tools may display the
-> equivalent version `1.0.0rc2`.
+> Current version: `1.0.0-rc.3`. Python packaging tools may display the
+> equivalent version `1.0.0rc3`.
 
 ## See what it does in a real conversation
 
@@ -57,10 +57,12 @@ agent-lane codex run \
   --prompt "Implement the new login flow and run its focused tests."
 ```
 
-agent-lane generates and persists an internal stable lane ID, while
-`login-flow` is the human-facing title. If the work is paused today, discovery
-returns the exact thread target needed to continue it; the human does not have
-to name or remember a lane ID.
+agent-lane generates and persists an internal stable lane ID. Explicit
+`--title login-flow` stores `login-flow` as `custom_title` and also seeds the
+new Codex task name. If `--title` is omitted, no custom title is stored and the
+lane follows the latest observed Codex task name. Results expose
+`lane_title = custom_title ?? codex_title ?? lane_id` together with
+`lane_title_source`; the human does not have to name or remember a lane ID.
 
 To keep one reasoning effort as the user default, configure agent-lane once:
 
@@ -120,10 +122,10 @@ pass `--lane-id`; normal interactive use can continue from the selected thread.
 
 Commands that operate on one task accept one of four mutually exclusive
 targets: `--thread-id` for an exact discovered session, `--target-title` for an
-exact known attached title, `--current` for the only attached task whose stored
-workspace equals the process working directory, or `--lane-id` for compatible
-automation. `run` and `goal set` may omit all four to create a new task with an
-internally generated lane ID.
+exact known attached custom or Codex title, `--current` for the only attached
+task whose stored workspace equals the process working directory, or
+`--lane-id` for compatible automation. `run` and `goal set` may omit all four
+to create a new task with an internally generated lane ID.
 
 Title matching is exact and case-insensitive; `--current` does not mean “most
 recent.” If a title or current directory matches more than one task, the command
@@ -163,6 +165,7 @@ databases or App UI automation.
 | `codex session attach` | `thread/read` | Validates an existing task, then binds it to an internal stable lane ID and execution mode; a caller-supplied lane ID is optional. |
 | `codex session name get` | `thread/read` | Reads the stored or live Codex task name. |
 | `codex session name set` | `thread/name/set`, then `thread/read` | Updates the Codex task name with optional conflict checking and exact read-back. |
+| `codex custom-title get/set/clear` | local lane alias | Reads, sets, or clears the explicit local override used by `lane_title`; it never renames the Codex task. |
 | `codex session outline` | `thread/read` | Returns a compact projection of task identity, turns, prompts, and execution state. |
 | `codex session read` | `thread/read` | Reads the full task, all turns, or one selected turn. |
 

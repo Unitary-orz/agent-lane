@@ -89,7 +89,7 @@ def _save_lane(aliases, lane_id="lane-1", thread_id="thread-1"):
         {
             "codex_thread_id": thread_id,
             "cwd": "/repo",
-            "title": "Active lane",
+            "custom_title": "Active lane",
             "current_turn_id": "turn-live",
             "last_status": "inProgress",
             "execution_mode": "app-sync",

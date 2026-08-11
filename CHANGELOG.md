@@ -6,6 +6,28 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] 🚧
 
+## [v1.0.0-rc.3] - 2026-08-11 🚀
+
+> Separate stable lane identity, live Codex naming, and explicit local title
+> overrides.
+
+### ✨ Added
+
+- Added `codex custom-title get/set/clear` for an explicit local lane-title
+  override that never renames the Codex task.
+
+### 🔄 Changed
+
+- Defined `lane_title = custom_title ?? codex_title ?? lane_id`; live Codex
+  title observations update `codex_title`, while an explicit `custom_title`
+  remains authoritative until cleared.
+
+### 🗑️ Removed
+
+- Removed legacy `title`, `title_source`, and `lane_label` fields, and stopped
+  persisting the computed `lane_title` and `lane_title_source` values in alias
+  schema v4 without migration.
+
 ### 🐞 Fixed
 
 - Fixed GitHub Actions annotated-tag validation by fetching the original remote

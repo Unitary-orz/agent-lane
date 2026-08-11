@@ -85,6 +85,17 @@ from agent_lane.cli import build_parser, main
             "--title",
             "API cleanup",
         ],
+        ["codex", "custom-title", "get", "--lane-id", "imported-task"],
+        [
+            "codex",
+            "custom-title",
+            "set",
+            "--lane-id",
+            "imported-task",
+            "--title",
+            "Pinned local title",
+        ],
+        ["codex", "custom-title", "clear", "--lane-id", "imported-task"],
         [
             "codex",
             "goal",

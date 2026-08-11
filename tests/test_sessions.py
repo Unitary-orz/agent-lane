@@ -113,7 +113,7 @@ def test_aliases_only_lookup_reports_last_turn_disabled(tmp_path):
     save_alias(
         "codex",
         "lane-1",
-        {"codex_thread_id": "thread-1", "title": "Needle lane"},
+        {"codex_thread_id": "thread-1", "custom_title": "Needle lane"},
         tmp_path,
     )
 
@@ -325,6 +325,45 @@ def test_refresh_aliases_updates_adopted_cwd_and_workspace(
     assert refreshed["workspace"]["path"] == str(live_cwd)
 
 
+def test_refresh_aliases_reloads_inside_lane_lock_before_saving(
+    tmp_path, monkeypatch
+):
+    aliases = tmp_path / "aliases"
+    stale = {
+        "lane_id": "lane-1",
+        "codex_thread_id": "thread-1",
+        "custom_title": "Old custom title",
+    }
+    save_alias("codex", "lane-1", stale, aliases)
+
+    class ConcurrentTitleCodex(FakeCodexContext):
+        def read_thread(self, thread_id, include_turns=False):
+            save_alias(
+                "codex",
+                "lane-1",
+                {
+                    "lane_id": "lane-1",
+                    "codex_thread_id": "thread-1",
+                    "custom_title": "Concurrent custom title",
+                },
+                aliases,
+            )
+            return super().read_thread(thread_id, include_turns=include_turns)
+
+    fake = ConcurrentTitleCodex(
+        {"thread-1": {"id": "thread-1", "name": "Live Codex title"}}
+    )
+    monkeypatch.setattr(cli, "CodexAppServer", lambda: fake)
+
+    refreshed = _refresh_aliases_from_codex([stale], aliases)[0]
+    stored = cli.load_alias("codex", "lane-1", aliases)
+
+    assert refreshed["custom_title"] == "Concurrent custom title"
+    assert refreshed["codex_title"] == "Live Codex title"
+    assert stored["custom_title"] == "Concurrent custom title"
+    assert stored["codex_title"] == "Live Codex title"
+
+
 def test_session_summaries_exclude_subagent_children_from_main_view():
     parent = {
         "id": "parent-1",
@@ -413,7 +452,9 @@ def test_session_summaries_do_not_synthesize_aliased_parent_from_child():
         "recencyAt": 20,
         "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "parent-1"}}},
     }
-    aliases = {"parent-1": {"lane_id": "lane-parent", "title": "Lane parent"}}
+    aliases = {
+        "parent-1": {"lane_id": "lane-parent", "custom_title": "Lane parent"}
+    }
 
     items = _session_summaries(
         [child],
@@ -816,7 +857,7 @@ def test_recent_uses_rollout_completion_without_transcript_reads_and_live_mtime(
         "completed-lane",
         {
             "codex_thread_id": "thread-completed",
-            "title": "Completed task",
+            "custom_title": "Completed task",
             "codex_recency_at": 20,
         },
         tmp_path,
@@ -905,7 +946,7 @@ def test_recent_uses_rollout_active_turn_instead_of_previous_final(
         "security-ops-agent",
         {
             "codex_thread_id": "thread-active",
-            "title": "Security ops active",
+            "custom_title": "Security ops active",
             "last_status": "completed",
             "last_final_text": "Old V0 closeout final.",
             "goal_status": "active",
@@ -1165,7 +1206,7 @@ def test_recent_pins_hidden_aliased_active_goal_ahead_of_recency_limit(
         "active-lane",
         {
             "codex_thread_id": "thread-active",
-            "title": "Hidden active lane",
+            "custom_title": "Hidden active lane",
             "goal_status": None,
             "last_status": "idle",
         },
@@ -2010,14 +2051,14 @@ def test_thread_outline_preserves_prompts_and_reports_incomplete_history():
 
     result = cli._thread_outline(
         thread,
-        {"lane_id": "lane-1", "title": "Lane title"},
+        {"lane_id": "lane-1", "custom_title": "Lane title"},
         fallback_thread_id="fallback",
     )
 
     assert result["lane_id"] == "lane-1"
-    assert result["title"] == "App title"
-    assert result["title_source"] == "codex_title"
-    assert result["lane_label"] == "Lane title"
+    assert result["lane_title"] == "Lane title"
+    assert result["lane_title_source"] == "custom_title"
+    assert result["codex_title"] == "App title"
     assert result["turn_count"] == 3
     assert result["prompt_count"] == 2
     assert result["history_complete"] is False
@@ -2105,7 +2146,15 @@ def test_outline_and_selected_read_are_read_only_for_lane_or_thread(
     alias_path = save_alias(
         "codex",
         "lane-1",
-        {"codex_thread_id": "thread-1", "title": "Lane title"},
+        {
+            "codex_thread_id": "thread-1",
+            "custom_title": "Lane title",
+            "title": "Removed title",
+            "title_source": "legacy",
+            "lane_label": "Removed label",
+            "lane_title": "Removed computed title",
+            "lane_title_source": "title",
+        },
         tmp_path,
     )
     before = alias_path.read_text(encoding="utf-8")
@@ -2162,6 +2211,16 @@ def test_outline_and_selected_read_are_read_only_for_lane_or_thread(
     assert "turns" not in selected["thread"]
     assert legacy["thread"] == {"thread": thread}
     assert included["thread"] == {"thread": thread}
+    removed_title_fields = {
+        "title",
+        "title_source",
+        "lane_label",
+        "lane_title",
+        "lane_title_source",
+    }
+    assert not removed_title_fields.intersection(selected["alias"])
+    assert not removed_title_fields.intersection(legacy["alias"])
+    assert not removed_title_fields.intersection(included["alias"])
     assert alias_path.read_text(encoding="utf-8") == before
 
     with pytest.raises(ValueError, match="no alias found"):

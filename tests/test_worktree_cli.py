@@ -11,6 +11,7 @@ from agent_lane.workspace import WorkspaceError
 
 class FakeRunCodex:
     started_cwd = None
+    set_names = []
 
     def __init__(self, *_args, **_kwargs):
         pass
@@ -25,7 +26,8 @@ class FakeRunCodex:
         type(self).started_cwd = cwd
         return "thread-1"
 
-    def set_thread_name(self, _thread_id, _title):
+    def set_thread_name(self, thread_id, title):
+        type(self).set_names.append((thread_id, title))
         return None
 
     def update_git_info(self, _thread_id, _git_info):
@@ -118,6 +120,8 @@ def test_run_creates_and_persists_managed_worktree_lane(tmp_path, monkeypatch, c
         "branch": "codex/lane-1",
         "app_native_handoff": False,
     }
+    FakeRunCodex.started_cwd = None
+    FakeRunCodex.set_names = []
     monkeypatch.setattr(cli, "CodexAppServer", FakeRunCodex)
     monkeypatch.setattr(cli, "create_managed_worktree", lambda *_args: workspace)
 
@@ -148,7 +152,52 @@ def test_run_creates_and_persists_managed_worktree_lane(tmp_path, monkeypatch, c
     assert result["workspace"]["kind"] == "git-worktree"
     assert result["workspace"]["app_native_handoff"] is False
     assert FakeRunCodex.started_cwd == str(target)
+    assert FakeRunCodex.set_names == [("thread-1", "source")]
+    assert result["codex_title"] == "source"
+    assert result["custom_title"] is None
+    assert alias["codex_title"] == "source"
+    assert "custom_title" not in alias
     assert alias["workspace"]["branch"] == "codex/lane-1"
+
+
+def test_blank_run_title_fails_before_worktree_or_alias_side_effects(
+    tmp_path, monkeypatch, capsys
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    aliases = tmp_path / "aliases"
+
+    monkeypatch.setattr(
+        cli,
+        "create_managed_worktree",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("worktree creation must not run")
+        ),
+    )
+
+    rc = main(
+        [
+            "codex",
+            "run",
+            "--lane-id",
+            "lane-1",
+            "--alias-root",
+            str(aliases),
+            "--cwd",
+            str(source),
+            "--worktree",
+            "auto",
+            "--title",
+            " ",
+            "--prompt",
+            "implement",
+        ]
+    )
+    result = decode_cli_output(capsys.readouterr().out)
+
+    assert rc == 1
+    assert result["error_code"] == "LANE_CUSTOM_TITLE_INVALID"
+    assert load_alias("codex", "lane-1", aliases) is None
 
 
 def test_cleanup_refuses_an_active_codex_thread(tmp_path, monkeypatch, capsys):

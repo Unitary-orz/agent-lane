@@ -114,5 +114,5 @@ def test_alias_binding_persists_mode_contract(tmp_path):
     )
 
     payload = path.read_text(encoding="utf-8")
-    assert '"schema_version": 3' in payload
+    assert '"schema_version": 4' in payload
     assert '"execution_mode": "app-sync"' in payload
