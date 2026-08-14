@@ -173,7 +173,7 @@ def test_session_list_and_read_project_same_state_and_explicit_control_boundary(
             "--thread-id",
             "thread-1",
             "--mode",
-            "independent",
+            "app-sync",
             "--alias-root",
             str(tmp_path),
         ]
@@ -195,6 +195,8 @@ def test_live_session_observation_suggests_app_sync_attach(
             "all",
             "--observe",
             "live",
+            "--detail",
+            "summary",
             "--alias-root",
             str(tmp_path),
         ]

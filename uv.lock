@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "agent-lane"
-version = "1.0.0rc3"
+version = "1.0.0rc4"
 source = { editable = "." }
 
 [package.optional-dependencies]

@@ -1,7 +1,7 @@
 ---
 name: agent-lane-codex
 description: "Use agent-lane to start, inspect, continue, steer, and close out durable Codex coding tasks, including optional App Sync."
-version: 1.0.0-rc.3
+version: 1.0.0-rc.4
 author: Unitary-orz
 license: MIT
 platforms: [macos]
@@ -212,15 +212,21 @@ agent-lane codex session outline --thread-id "<task-id>" --observe live
 agent-lane codex session read --thread-id "<task-id>" --include-turns
 ```
 
-Stored observation is the default. If the parent requires current Codex state,
-request `--observe live` and surface any failure; do not silently substitute a
-cached view.
+Automatic live observation and compact list output are the defaults. If App
+Sync is unavailable, persisted data is historical evidence only. For results
+with canonical execution, require `execution.state: unknown`, `stale: true`,
+and the non-authoritative warning; `outline` instead returns that warning with
+historical turn statuses and no canonical execution. Never treat either as
+current. If the parent requires live state with no fallback, request
+`--observe live` and surface any failure. Request `--detail summary` only when
+the larger execution, excerpt, and control projection is needed.
 
 Discovery, session inspection, and exact-thread `status`, `wait`, `checkpoint`,
-`closeout`, and `goal get` are read-only and do not require a lane. Inspect the
-returned `control`: `requires_explicit_attach: true` means the task is not
-controllable through agent-lane yet, and `attach_argv` gives a machine-readable
-explicit next step.
+`closeout`, and `goal get` are read-only and do not require a lane. Compact
+discovery reports `requires_attach`; `--detail summary` and exact session reads
+return the full `control` contract. There,
+`requires_explicit_attach: true` means the task is not controllable through
+agent-lane yet, and `attach_argv` gives a machine-readable explicit next step.
 
 Attach an existing task explicitly:
 
@@ -235,6 +241,14 @@ returns `control.send_target_argv`; it never starts a turn. When no lane ID is
 supplied, it generates a deterministic internal binding ID and repeated attach
 of that thread reuses it. Follow-up execution is a separate `send` against the
 exact thread target.
+
+Attach checks the task's latest observed command workspace before writing the
+binding when public command-cwd evidence is available. On
+`CODEX_ATTACH_WORKSPACE_DRIFT`, do not send a turn: use
+`recommended_attach_argv` for a first or App-adopted binding, or the returned
+`run` replacement recovery for an existing managed lane. A preflight status of
+`unavailable` may proceed only when it does not move an existing managed lane,
+so retain the runtime drift guard as the final authority.
 
 Use `session name get/set` to read or change the task name. Do not infer that a
 name observed in one store has been written to another; live read-back is an

@@ -60,6 +60,7 @@ from .workspace import (
     cleanup_managed_worktree,
     create_managed_worktree,
     operation_lock,
+    sibling_worktree_drift,
     workspace_binding_changed,
     workspace_snapshot,
 )
@@ -233,7 +234,7 @@ def _adapt_session_query_args(args: argparse.Namespace) -> None:
     args.include_unaliased = args.scope == "all"
     args.include_subagents = args.threads == "all"
     args.include_last_turn = args.detail == "summary"
-    args.refresh = args.observe == "live"
+    args.refresh = args.observe != "stored"
     args.brief = False
 
 
@@ -1615,6 +1616,9 @@ def _direct_thread_snapshot(
         goal if isinstance(goal, dict) else None,
         thread=thread,
         goal_source=goal_source,
+        thread_authoritative=bool(transport["live_status_authoritative"]),
+        observed_at=transport.get("observed_at"),
+        observation_mode=str(transport.get("observation_mode") or "unknown"),
     )
     snapshot = {
         "ok": True,
@@ -2132,9 +2136,53 @@ def cmd_codex_doctor(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _non_authoritative_session_warning(
+    fallback_reason: str | None = None,
+) -> dict[str, Any]:
+    warning = {
+        "code": "CODEX_SESSION_STATE_NON_AUTHORITATIVE",
+        "message": (
+            "live App Sync state was not observed; persisted session data is "
+            "historical evidence and current execution state is unknown"
+        ),
+    }
+    if fallback_reason is not None:
+        warning["fallback_reason"] = fallback_reason
+    return warning
+
+
+def _stored_alias_observation() -> dict[str, Any]:
+    return {
+        "app_server_transport": None,
+        "transport_degraded": False,
+        "transport_fallback_reason": None,
+        "observation_mode": "stored_alias",
+        "live_status_authoritative": False,
+        "observed_at": time.time(),
+        "warnings": [_non_authoritative_session_warning()],
+    }
+
+
+def _annotate_alias_observation(
+    aliases: list[dict[str, Any]],
+    transport: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **item,
+            "_session_observation": {
+                "transport": transport,
+                "thread": None,
+            },
+        }
+        for item in aliases
+    ]
+
+
 def _open_read_only_codex(
     observe: str = "auto",
 ) -> tuple[CodexAppServer, dict[str, Any]]:
+    observed_at = time.time()
     if observe == "stored":
         codex = CodexAppServer(transport="stdio")
         return codex, {
@@ -2143,6 +2191,8 @@ def _open_read_only_codex(
             "transport_fallback_reason": None,
             "observation_mode": "stored",
             "live_status_authoritative": False,
+            "observed_at": observed_at,
+            "warnings": [_non_authoritative_session_warning()],
         }
     if observe == "live":
         codex = CodexAppServer(transport="daemon")
@@ -2152,11 +2202,12 @@ def _open_read_only_codex(
             "transport_fallback_reason": None,
             "observation_mode": "live",
             "live_status_authoritative": True,
+            "observed_at": observed_at,
         }
     if observe != "auto":
         raise WorkspaceError(
             "SESSION_OBSERVATION_MODE_INVALID",
-            "session observation must be stored or live",
+            "session observation must be auto, stored, or live",
             observation_mode=observe,
             retryable=False,
         )
@@ -2186,21 +2237,35 @@ def _open_read_only_codex(
             "shared_daemon" if live_status_authoritative else "persisted_stdio"
         ),
         "live_status_authoritative": live_status_authoritative,
+        "observed_at": observed_at,
+        "warnings": []
+        if live_status_authoritative
+        else [
+            _non_authoritative_session_warning(
+                fallback_error.error_code if fallback_error is not None else None
+            )
+        ],
     }
 
 
 def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
     alias_root = Path(args.alias_root).expanduser()
     limit = max(args.limit, 0)
+    detail = str(getattr(args, "detail", "summary"))
     if args.aliases_only:
         aliases = _sorted_aliases(alias_root)
+        transport: dict[str, Any] = {}
         if args.refresh:
             aliases = _refresh_aliases_from_codex(
                 aliases,
                 alias_root,
                 observe=getattr(args, "observe", "auto"),
+                transport_out=transport,
             )
             aliases = _sort_aliases(aliases)
+        else:
+            transport = _stored_alias_observation()
+            aliases = _annotate_alias_observation(aliases, transport)
         return {
             "ok": True,
             "source": "lane_aliases",
@@ -2209,11 +2274,14 @@ def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
             "include_unaliased": False,
             "refreshed": bool(args.refresh),
             "include_last_turn": False,
-            **_project_grouped_output(
+            "detail": detail,
+            **transport,
+            **_project_session_output(
                 [
                     _alias_summary(item, alias_root=alias_root)
                     for item in aliases[:limit]
-                ]
+                ],
+                detail=detail,
             ),
         }
 
@@ -2272,6 +2340,9 @@ def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
             codex,
             items,
             goal_observations=goal_observations,
+            thread_authoritative=bool(transport["live_status_authoritative"]),
+            observed_at=transport.get("observed_at"),
+            observation_mode=str(transport.get("observation_mode") or "unknown"),
         )
         for item in items:
             if item.get("goal_status") == "active":
@@ -2279,7 +2350,17 @@ def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
                     natural_thread_ids
                 )
         if args.include_last_turn:
-            items = _enrich_session_summaries_with_last_turns(codex, items)
+            items = _enrich_session_summaries_with_last_turns(
+                codex,
+                items,
+                thread_authoritative=bool(
+                    transport["live_status_authoritative"]
+                ),
+                observed_at=transport.get("observed_at"),
+                observation_mode=str(
+                    transport.get("observation_mode") or "unknown"
+                ),
+            )
         items = _enrich_session_summaries_with_active_turns(
             items,
             rollout_facts=rollout_facts,
@@ -2295,7 +2376,7 @@ def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
         )[:limit]
         items = _strip_session_internal_fields(items)
         items = _apply_control_context(items, transport, alias_root=alias_root)
-        project_output = _project_grouped_output(items)
+        project_output = _project_session_output(items, detail=detail)
     hidden_active_goal_count = len(
         active_goal_thread_ids.difference(natural_thread_ids)
     )
@@ -2310,6 +2391,7 @@ def cmd_codex_recent(args: argparse.Namespace) -> dict[str, Any]:
         "include_unaliased": True,
         "include_subagents": bool(args.include_subagents),
         "include_last_turn": bool(args.include_last_turn),
+        "detail": detail,
         "sort": {
             "key": "active_goal_then_recency_at",
             "direction": "desc",
@@ -2334,6 +2416,9 @@ def _find_page_has_enough_matches(
     include_subagents: bool,
     query: str,
     limit: int,
+    thread_authoritative: bool,
+    observed_at: float | None,
+    observation_mode: str,
 ) -> bool:
     summaries = _session_summaries(
         candidates,
@@ -2345,6 +2430,9 @@ def _find_page_has_enough_matches(
         codex,
         summaries,
         goal_observations=goal_observations,
+        thread_authoritative=thread_authoritative,
+        observed_at=observed_at,
+        observation_mode=observation_mode,
     )
     return (
         len([item for item in summaries if _matches_session_summary(item, query)])
@@ -2356,14 +2444,20 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
     alias_root = Path(args.alias_root).expanduser()
     limit = max(args.limit, 0)
     query = str(args.query)
+    detail = str(getattr(args, "detail", "summary"))
     if args.aliases_only:
         candidates = _sorted_aliases(alias_root)
+        transport: dict[str, Any] = {}
         if args.refresh:
             candidates = _refresh_aliases_from_codex(
                 candidates,
                 alias_root,
                 observe=getattr(args, "observe", "auto"),
+                transport_out=transport,
             )
+        else:
+            transport = _stored_alias_observation()
+            candidates = _annotate_alias_observation(candidates, transport)
         matches = [item for item in candidates if _matches_alias(item, query)]
         matches = _sort_aliases(matches)[:limit]
         return {
@@ -2374,11 +2468,14 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
             "query": query,
             "refreshed": bool(args.refresh),
             "include_last_turn": False,
-            **_project_grouped_output(
+            "detail": detail,
+            **transport,
+            **_project_session_output(
                 [
                     _alias_summary(item, alias_root=alias_root)
                     for item in matches
-                ]
+                ],
+                detail=detail,
             ),
         }
 
@@ -2397,6 +2494,13 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
                 include_subagents=args.include_subagents,
                 query=query,
                 limit=limit,
+                thread_authoritative=bool(
+                    transport["live_status_authoritative"]
+                ),
+                observed_at=transport.get("observed_at"),
+                observation_mode=str(
+                    transport.get("observation_mode") or "unknown"
+                ),
             )
 
         searched, searched_pagination = _collect_session_pages(
@@ -2423,13 +2527,26 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
             codex,
             summaries,
             goal_observations=goal_observations,
+            thread_authoritative=bool(transport["live_status_authoritative"]),
+            observed_at=transport.get("observed_at"),
+            observation_mode=str(transport.get("observation_mode") or "unknown"),
         )
         matches = [
             item for item in summaries if _matches_session_summary(item, query)
         ]
         rollout_facts = _load_session_rollout_facts(matches, alias_by_thread_id)
         if args.include_last_turn:
-            matches = _enrich_session_summaries_with_last_turns(codex, matches)
+            matches = _enrich_session_summaries_with_last_turns(
+                codex,
+                matches,
+                thread_authoritative=bool(
+                    transport["live_status_authoritative"]
+                ),
+                observed_at=transport.get("observed_at"),
+                observation_mode=str(
+                    transport.get("observation_mode") or "unknown"
+                ),
+            )
         matches = _enrich_session_summaries_with_active_turns(
             matches,
             rollout_facts=rollout_facts,
@@ -2449,7 +2566,7 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
             transport,
             alias_root=alias_root,
         )
-        project_output = _project_grouped_output(matches)
+        project_output = _project_session_output(matches, detail=detail)
     return {
         "ok": True,
         "source": "codex_app",
@@ -2458,6 +2575,7 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
         "query": query,
         "include_subagents": bool(args.include_subagents),
         "include_last_turn": bool(args.include_last_turn),
+        "detail": detail,
         "sort": {
             "key": "recency_at",
             "direction": "desc",
@@ -2470,6 +2588,168 @@ def cmd_codex_find(args: argparse.Namespace) -> dict[str, Any]:
         **transport,
         **project_output,
     }
+
+
+def _latest_command_cwd(thread: dict[str, Any]) -> str | None:
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        return None
+    for turn in reversed(turns):
+        if not isinstance(turn, dict):
+            continue
+        items = turn.get("items")
+        if not isinstance(items, list):
+            continue
+        for item in reversed(items):
+            if not isinstance(item, dict) or item.get("type") != "commandExecution":
+                continue
+            raw_cwd = _nonempty_text(item.get("cwd"))
+            if raw_cwd is not None:
+                return str(Path(raw_cwd).expanduser().resolve(strict=False))
+    return None
+
+
+def _recommended_attach_argv(
+    *,
+    thread_id: str,
+    lane_id: str,
+    alias_root: Path,
+    execution_mode: str,
+    cwd: str,
+) -> list[str]:
+    return [
+        "codex",
+        "session",
+        "attach",
+        "--thread-id",
+        thread_id,
+        "--lane-id",
+        lane_id,
+        "--mode",
+        execution_mode,
+        "--alias-root",
+        str(alias_root),
+        "--cwd",
+        cwd,
+    ]
+
+
+def _attach_workspace_preflight(
+    *,
+    thread: dict[str, Any],
+    thread_id: str,
+    lane_id: str,
+    alias_root: Path,
+    execution_mode: str,
+    requested_cwd: str | None,
+    existing: dict[str, Any] | None,
+) -> tuple[str | None, dict[str, Any], str]:
+    explicit_cwd = _nonempty_text(requested_cwd)
+    thread_cwd = _nonempty_text(thread.get("cwd"))
+    observed_cwd = _latest_command_cwd(thread)
+    configured_cwd = _resolve_cwd(explicit_cwd or thread_cwd, None)
+    if configured_cwd is None and observed_cwd is not None:
+        configured_cwd = _resolve_cwd(observed_cwd, None)
+
+    source = (
+        "explicit_attach"
+        if explicit_cwd is not None
+        else "recent_command"
+        if observed_cwd is not None
+        else "thread"
+    )
+    preflight = {
+        "status": "unavailable" if observed_cwd is None else "matched",
+        "configured_cwd": configured_cwd,
+        "thread_cwd": thread_cwd,
+        "observed_cwd": observed_cwd,
+        "observed_worktree": None,
+        "source": "recent_command" if observed_cwd is not None else "unavailable",
+    }
+    existing_cwd = _nonempty_text((existing or {}).get("cwd"))
+    managed_lane = bool(
+        existing is not None and existing.get("adopted_from") != "codex-app"
+    )
+    replacement_cwd = observed_cwd or configured_cwd
+    managed_drift = (
+        sibling_worktree_drift(existing_cwd, replacement_cwd)
+        if existing_cwd is not None and replacement_cwd is not None
+        else None
+    )
+    if (
+        managed_lane
+        and existing_cwd is not None
+        and replacement_cwd is not None
+        and workspace_binding_changed(existing_cwd, replacement_cwd)
+    ):
+        raise WorkspaceError(
+            "CODEX_ATTACH_WORKSPACE_DRIFT",
+            "the task's observed workspace differs from its managed lane; "
+            "replace the Codex task through run instead of moving the binding",
+            control_created=False,
+            lane_id=lane_id,
+            codex_thread_id=thread_id,
+            configured_cwd=existing_cwd,
+            thread_cwd=thread_cwd,
+            observed_cwd=observed_cwd,
+            observed_worktree=(
+                managed_drift.get("observed_worktree")
+                if isinstance(managed_drift, dict)
+                else replacement_cwd
+            ),
+            git_common_dir=(
+                managed_drift.get("git_common_dir")
+                if isinstance(managed_drift, dict)
+                else None
+            ),
+            recommended_cwd=replacement_cwd,
+            replacement_required=True,
+            required_action="run_workspace_rebind",
+            recommended_attach_argv=None,
+            recovery={
+                "command": "run",
+                "lane_id": lane_id,
+                "cwd": replacement_cwd,
+                "thread_action": "replace",
+            },
+            retryable=False,
+        )
+    if configured_cwd is None or observed_cwd is None:
+        return configured_cwd, preflight, source
+
+    drift = sibling_worktree_drift(configured_cwd, observed_cwd)
+    binding_changed = workspace_binding_changed(configured_cwd, observed_cwd)
+    if drift is None and not binding_changed:
+        return configured_cwd, preflight, source
+
+    observed_worktree = (
+        drift.get("observed_worktree") if isinstance(drift, dict) else observed_cwd
+    )
+    raise WorkspaceError(
+        "CODEX_ATTACH_WORKSPACE_DRIFT",
+        "the task's latest command ran in a different workspace; retry attach "
+        "with the observed cwd",
+        control_created=False,
+        lane_id=lane_id,
+        codex_thread_id=thread_id,
+        configured_cwd=configured_cwd,
+        thread_cwd=thread_cwd,
+        observed_cwd=observed_cwd,
+        observed_worktree=observed_worktree,
+        git_common_dir=(
+            drift.get("git_common_dir") if isinstance(drift, dict) else None
+        ),
+        recommended_cwd=observed_cwd,
+        replacement_required=False,
+        recommended_attach_argv=_recommended_attach_argv(
+            thread_id=thread_id,
+            lane_id=lane_id,
+            alias_root=alias_root,
+            execution_mode=execution_mode,
+            cwd=observed_cwd,
+        ),
+        retryable=False,
+    )
 
 
 def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
@@ -2521,18 +2801,27 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
             )
 
     with CodexAppServer(transport=_transport_for_mode(execution_mode)) as codex:
-        result = codex.read_thread(thread_id, include_turns=False)
+        result = codex.read_thread(thread_id, include_turns=True)
     thread = result.get("thread") or {}
+    cwd, workspace_preflight, workspace_binding_source = (
+        _attach_workspace_preflight(
+            thread=thread,
+            thread_id=thread_id,
+            lane_id=str(args.lane_id),
+            alias_root=alias_root,
+            execution_mode=execution_mode,
+            requested_cwd=getattr(args, "cwd", None),
+            existing=existing,
+        )
+    )
 
     if existing is not None:
         alias = dict(existing)
         if alias.get("adopted_from") == "codex-app":
-            if thread.get("cwd"):
-                _sync_adopted_thread_cwd(alias, thread)
-            elif args.cwd:
-                cwd = _resolve_cwd(args.cwd, None)
+            if cwd:
                 alias["cwd"] = cwd
                 alias["workspace"] = _workspace_status(cwd, None)
+                alias["workspace_binding_source"] = workspace_binding_source
         _update_thread_alias(alias, thread)
         if getattr(args, "title", None) is not None:
             alias["custom_title"] = requested_custom_title
@@ -2561,6 +2850,7 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
             "workspace": workspace,
             "execution_mode": execution_mode,
             "execution_mode_source": execution_mode_source,
+            "workspace_preflight": workspace_preflight,
             "control": _control_contract(
                 alias,
                 thread_id,
@@ -2569,8 +2859,6 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
             ),
         }
 
-    raw_cwd = thread.get("cwd") or args.cwd
-    cwd = _resolve_cwd(str(raw_cwd) if raw_cwd else None, None)
     if not cwd:
         raise WorkspaceError(
             "CODEX_THREAD_CWD_REQUIRED",
@@ -2599,6 +2887,7 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
             "cwd": cwd,
             "sandbox": sandbox,
             "workspace": workspace,
+            "workspace_binding_source": workspace_binding_source,
             "adopted_from": "codex-app",
             "adopted_at": alias.get("adopted_at") or now,
             "created_at": alias.get("created_at") or now,
@@ -2635,6 +2924,7 @@ def cmd_codex_adopt(args: argparse.Namespace) -> dict[str, Any]:
         "workspace": workspace,
         "execution_mode": execution_mode,
         "execution_mode_source": execution_mode_source,
+        "workspace_preflight": workspace_preflight,
         "control": _control_contract(
             alias,
             thread_id,
@@ -2881,6 +3171,9 @@ def cmd_codex_read(args: argparse.Namespace) -> dict[str, Any]:
         goal if isinstance(goal, dict) else None,
         thread=thread,
         goal_source=goal_source,
+        thread_authoritative=bool(transport["live_status_authoritative"]),
+        observed_at=transport.get("observed_at"),
+        observation_mode=str(transport.get("observation_mode") or "unknown"),
     )
     common = {
         "goal_status": goal.get("status") if isinstance(goal, dict) else None,
@@ -3832,12 +4125,19 @@ def _runner_state(
     thread_observed: bool | None = None,
     observed_turn: dict[str, Any] | None = None,
     goal_source: str | None = None,
+    thread_authoritative: bool = True,
+    observed_at: float | None = None,
+    observation_mode: str | None = None,
 ) -> dict[str, Any]:
     if thread is not None:
         thread_observed = True
         thread_active = _thread_has_active_turn(thread)
     elif thread_observed is None:
         thread_observed = thread_active is not None
+    evidence_thread_observed = bool(thread_observed)
+    observed_thread_active = thread_active if evidence_thread_observed else None
+    current_thread_observed = evidence_thread_observed and thread_authoritative
+    thread_active = observed_thread_active if current_thread_observed else None
 
     pid = alias.get("runner_pid")
     runner_alive = process_running(pid)
@@ -3889,14 +4189,19 @@ def _runner_state(
     elif thread_active is True:
         execution_source = "thread"
     else:
-        execution_source = "none" if thread_observed else "unknown"
+        execution_source = "none" if current_thread_observed else "unknown"
 
-    alias_proves_inactive = last_status in STOPPED_RUNNER_STATUSES or (
-        "last_status" in alias and last_status == "idle"
+    terminal_evidence_authoritative = thread_authoritative or isinstance(
+        observed_turn,
+        dict,
+    )
+    alias_proves_inactive = terminal_evidence_authoritative and (
+        last_status in STOPPED_RUNNER_STATUSES
+        or ("last_status" in alias and last_status == "idle")
     )
     if execution_active:
         needs_resume = False
-    elif not thread_observed and not alias_proves_inactive:
+    elif not current_thread_observed and not alias_proves_inactive:
         needs_resume = False
     elif goal_status == "active":
         needs_resume = True
@@ -3908,6 +4213,11 @@ def _runner_state(
     alias["runner_alive"] = runner_alive
     alias["needs_resume"] = needs_resume
     raw_last_turn = _observed_last_turn(thread, alias, observed_turn)
+    if (
+        not thread_authoritative
+        and raw_last_turn.get("source") == "app_server"
+    ):
+        raw_last_turn = {**raw_last_turn, "source": "persisted_app_server"}
     canonical_last_turn = _canonical_last_turn(
         alias,
         active=execution_active,
@@ -3918,7 +4228,7 @@ def _runner_state(
     )
     if (
         not execution_active
-        and thread_observed
+        and current_thread_observed
         and str(canonical_last_turn.get("status") or "").casefold()
         in {"active", "inprogress", "in_progress", "running", "started", "starting"}
     ):
@@ -3929,15 +4239,25 @@ def _runner_state(
         }
     if execution_active:
         state = "active"
-    elif thread_observed or _is_terminal_turn_status(
-        canonical_last_turn.get("status")
-    ) or last_status in STOPPED_RUNNER_STATUSES:
+    elif current_thread_observed or (
+        terminal_evidence_authoritative
+        and _is_terminal_turn_status(canonical_last_turn.get("status"))
+    ) or (
+        terminal_evidence_authoritative
+        and last_status in STOPPED_RUNNER_STATUSES
+    ):
         state = "inactive"
-    elif "last_status" in alias and last_status == "idle":
+    elif (
+        terminal_evidence_authoritative
+        and "last_status" in alias
+        and last_status == "idle"
+    ):
         state = "inactive"
     else:
         state = "unknown"
-    if execution_active:
+    if state == "unknown":
+        effective_status = "unknown"
+    elif execution_active:
         effective_status = "inProgress"
     elif last_status in {"stale", "timed_out"}:
         effective_status = last_status
@@ -3948,7 +4268,7 @@ def _runner_state(
     conflicts = _execution_conflicts(
         active=execution_active,
         thread_active=thread_active,
-        thread_observed=bool(thread_observed),
+        thread_observed=current_thread_observed,
         runner_alive=runner_alive,
         local_status=last_status,
         raw_last_turn=raw_last_turn,
@@ -3958,23 +4278,34 @@ def _runner_state(
         decision_source = execution_source
     elif isinstance(observed_turn, dict):
         decision_source = "turn_result"
-    elif thread_observed:
+    elif current_thread_observed:
         decision_source = "thread"
+    elif evidence_thread_observed:
+        decision_source = "persisted_thread"
     elif "last_status" in alias:
         decision_source = "alias"
     else:
         decision_source = "unknown"
+    execution_authoritative = state != "unknown"
     execution = {
         "state": state,
         "active": execution_active if state != "unknown" else None,
         "effective_turn_status": effective_status,
         "source": decision_source,
+        "authoritative": execution_authoritative,
+        "stale": not execution_authoritative,
+        "observed_at": observed_at if observed_at is not None else time.time(),
+        "observation_mode": observation_mode,
         "needs_resume": needs_resume,
         "evidence": {
             "thread": {
-                "observed": bool(thread_observed),
+                "observed": evidence_thread_observed,
+                "authoritative": (
+                    thread_authoritative and evidence_thread_observed
+                ),
                 "status": _thread_status_type(thread),
-                "active": thread_active if thread_observed else None,
+                "active": thread_active if current_thread_observed else None,
+                "observed_active": observed_thread_active,
                 "active_turn_id": canonical_last_turn.get("turn_id")
                 if thread_active is True
                 else None,
@@ -5059,6 +5390,11 @@ def _sync_adopted_thread_cwd(
     thread: dict[str, Any],
 ) -> None:
     if alias.get("adopted_from") != "codex-app":
+        return
+    if alias.get("workspace_binding_source") in {
+        "explicit_attach",
+        "recent_command",
+    }:
         return
     raw_cwd = thread.get("cwd")
     if not raw_cwd:
@@ -6215,18 +6551,29 @@ def _refresh_aliases_from_codex(
     alias_root: Path,
     *,
     observe: str = "auto",
+    transport_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     refreshed: list[dict[str, Any]] = []
-    codex, _transport = _open_read_only_codex(observe)
+    codex, transport = _open_read_only_codex(observe)
+    if transport_out is not None:
+        transport_out.update(transport)
     with codex:
         for alias in aliases:
             item = _project_codex_alias(alias)
+            observed_thread: dict[str, Any] | None = None
             thread_id = item.get("codex_thread_id")
             if not thread_id:
+                item["_session_observation"] = {
+                    "transport": transport,
+                    "thread": None,
+                }
                 refreshed.append(item)
                 continue
             try:
                 thread = codex.read_thread(str(thread_id), include_turns=False)
+                candidate = thread.get("thread")
+                if isinstance(candidate, dict):
+                    observed_thread = candidate
                 lane_id = str(item.get("lane_id") or "")
                 with operation_lock(alias_root, lane_id):
                     current = load_alias(CODEX_PROVIDER, lane_id, alias_root)
@@ -6243,11 +6590,20 @@ def _refresh_aliases_from_codex(
                             observed_thread_id=observed_thread_id,
                             retryable=False,
                         )
-                    _sync_adopted_thread_cwd(item, thread.get("thread") or {})
-                    _update_thread_alias(item, thread.get("thread") or {})
+                    _sync_adopted_thread_cwd(item, observed_thread or {})
+                    _update_thread_alias(item, observed_thread or {})
                     save_alias(CODEX_PROVIDER, lane_id, item, alias_root)
             except Exception as exc:
+                observed_thread = None
                 item["refresh_error"] = str(exc)
+            item["_session_observation"] = {
+                "transport": transport,
+                "thread": (
+                    {"status": observed_thread.get("status")}
+                    if observed_thread is not None
+                    else None
+                ),
+            }
             refreshed.append(item)
     return refreshed
 
@@ -6259,7 +6615,33 @@ def _alias_summary(
 ) -> dict[str, Any]:
     stored_goal = item.get("goal")
     goal = stored_goal if isinstance(stored_goal, dict) else None
-    runner = _runner_state(dict(item), goal)
+    observation = item.get("_session_observation")
+    transport = (
+        observation.get("transport")
+        if isinstance(observation, dict)
+        and isinstance(observation.get("transport"), dict)
+        else None
+    )
+    observed_thread = (
+        observation.get("thread") if isinstance(observation, dict) else None
+    )
+    runner = _runner_state(
+        dict(item),
+        goal,
+        thread=observed_thread if isinstance(observed_thread, dict) else None,
+        thread_authoritative=(
+            bool(transport.get("live_status_authoritative"))
+            and isinstance(observed_thread, dict)
+            if transport is not None
+            else True
+        ),
+        observed_at=transport.get("observed_at") if transport is not None else None,
+        observation_mode=(
+            str(transport.get("observation_mode") or "unknown")
+            if transport is not None
+            else None
+        ),
+    )
     return {
         "kind": "lane_alias",
         "aliased": True,
@@ -6475,6 +6857,10 @@ def _assistant_final_text(turn: dict[str, Any]) -> str | None:
 def _enrich_session_summaries_with_last_turns(
     codex: CodexAppServer,
     items: list[dict[str, Any]],
+    *,
+    thread_authoritative: bool = True,
+    observed_at: float | None = None,
+    observation_mode: str | None = None,
 ) -> list[dict[str, Any]]:
     enriched_items: list[dict[str, Any]] = []
     for item in items:
@@ -6512,6 +6898,9 @@ def _enrich_session_summaries_with_last_turns(
             _apply_session_execution_state(
                 enriched,
                 thread=parent_thread or None,
+                thread_authoritative=thread_authoritative,
+                observed_at=observed_at,
+                observation_mode=observation_mode,
             )
         )
     return enriched_items
@@ -6813,6 +7202,68 @@ def _strip_session_internal_fields(
     return stripped_items
 
 
+def _project_session_output(
+    items: list[dict[str, Any]],
+    *,
+    detail: str,
+) -> dict[str, Any]:
+    if detail != "compact":
+        return _project_grouped_output(items)
+    return {"items": [_compact_session_summary(item) for item in items]}
+
+
+def _compact_session_summary(item: dict[str, Any]) -> dict[str, Any]:
+    execution = item.get("execution")
+    if not isinstance(execution, dict):
+        execution = {}
+    authoritative = bool(execution.get("authoritative"))
+    state = str(execution.get("state") or "unknown")
+    status = str(execution.get("effective_turn_status") or "unknown")
+    if not authoritative:
+        state = "unknown"
+        status = "unknown"
+
+    locations = item.get("locations")
+    cwd = locations.get("cwd") if isinstance(locations, dict) else None
+    if cwd is None:
+        cwd = item.get("cwd")
+    control = item.get("control")
+    requires_attach = (
+        bool(control.get("requires_explicit_attach"))
+        if isinstance(control, dict)
+        else True
+    )
+    last_turn = item.get("last_turn")
+    final_lead = (
+        last_turn.get("assistant_final_lead")
+        if isinstance(last_turn, dict)
+        else None
+    )
+    if not final_lead:
+        final_lead = _clip(_first_paragraph(item.get("last_final_text")), 160)
+    raw_title = item.get("lane_title") or item.get("name") or item.get("preview")
+    title = _clip(_first_paragraph(str(raw_title)) if raw_title else None, 160)
+
+    return {
+        "thread_id": item.get("id") or item.get("codex_thread_id"),
+        "title": title,
+        "cwd": cwd,
+        "updated_at": _normalized_recency(
+            item.get("recency_at"),
+            fallback=item.get("thread_recency_at"),
+        ),
+        "execution": {
+            "state": state,
+            "status": status,
+            "authoritative": authoritative,
+            "stale": bool(execution.get("stale", not authoritative)),
+            "observed_at": execution.get("observed_at"),
+        },
+        "final_lead": final_lead,
+        "requires_attach": requires_attach,
+    }
+
+
 def _project_grouped_output(
     items: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -6897,6 +7348,9 @@ def _enrich_session_summaries_with_goals(
     items: list[dict[str, Any]],
     *,
     goal_observations: dict[str, dict[str, Any]] | None = None,
+    thread_authoritative: bool = True,
+    observed_at: float | None = None,
+    observation_mode: str | None = None,
 ) -> list[dict[str, Any]]:
     observations = goal_observations if goal_observations is not None else {}
     enriched_items: list[dict[str, Any]] = []
@@ -6927,7 +7381,14 @@ def _enrich_session_summaries_with_goals(
         enriched.update(observation)
         if "goal_refresh_error" not in observation:
             enriched.pop("goal_refresh_error", None)
-        enriched_items.append(_apply_session_execution_state(enriched))
+        enriched_items.append(
+            _apply_session_execution_state(
+                enriched,
+                thread_authoritative=thread_authoritative,
+                observed_at=observed_at,
+                observation_mode=observation_mode,
+            )
+        )
     return enriched_items
 
 
@@ -7021,6 +7482,9 @@ def _apply_session_execution_state(
     item: dict[str, Any],
     *,
     thread: dict[str, Any] | None = None,
+    thread_authoritative: bool = True,
+    observed_at: float | None = None,
+    observation_mode: str | None = None,
 ) -> dict[str, Any]:
     enriched = dict(item)
     observed_thread = thread or {"status": enriched.get("status")}
@@ -7031,6 +7495,9 @@ def _apply_session_execution_state(
         goal,
         thread=observed_thread,
         goal_source=str(enriched.get("goal_status_source") or "unavailable"),
+        thread_authoritative=thread_authoritative,
+        observed_at=observed_at,
+        observation_mode=observation_mode,
     )
     enriched.update(_execution_fields(runner))
     return enriched

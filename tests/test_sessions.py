@@ -54,10 +54,12 @@ def test_session_list_and_find_detail_controls_summary_enrichment():
     find = parser.parse_args(["codex", "session", "find", "needle"])
     find_no = parser.parse_args(["codex", "session", "find", "needle", "--detail", "metadata"])
 
-    assert recent.detail == "summary"
+    assert recent.detail == "compact"
+    assert recent.observe == "auto"
     assert recent.scope == "all"
     assert recent_no.detail == "metadata"
-    assert find.detail == "summary"
+    assert find.detail == "compact"
+    assert find.observe == "auto"
     assert find_no.detail == "metadata"
 
 
@@ -82,7 +84,7 @@ def test_outline_and_read_parser_support_lane_or_thread_targets():
 
     assert outline.thread_id == "thread-1"
     assert outline.lane_id is None
-    assert outline.observe == "stored"
+    assert outline.observe == "auto"
     assert selected.lane_id == "lane-1"
     assert selected.turn_index == 2
 
@@ -641,6 +643,317 @@ def test_recent_auto_transport_falls_back_to_marked_persisted_stdio(
     assert result["items"][0]["requested_model_source"] == "unknown"
     assert result["items"][0]["requested_effort"] is None
     assert result["items"][0]["requested_effort_source"] == "unknown"
+
+
+def test_persisted_stdio_turn_is_evidence_not_an_authoritative_terminal_state(
+    tmp_path,
+    monkeypatch,
+):
+    class PersistedCodex:
+        transport = "stdio"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def list_threads(self, **_kwargs):
+            return {
+                "data": [
+                    {
+                        "id": "thread-1",
+                        "name": "Persisted task",
+                        "cwd": str(tmp_path),
+                        "status": {"type": "notLoaded"},
+                        "recencyAt": 10,
+                    }
+                ]
+            }
+
+        def read_thread(self, thread_id, include_turns=False):
+            assert thread_id == "thread-1"
+            assert include_turns is True
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "cwd": str(tmp_path),
+                    "status": {"type": "notLoaded"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "status": "interrupted",
+                            "items": [],
+                        }
+                    ],
+                }
+            }
+
+        def get_goal(self, _thread_id):
+            return None
+
+    def open_codex(*, transport=None):
+        if transport is None:
+            raise CodexRpcError(
+                "daemon unavailable",
+                error_code="CODEX_DAEMON_UNAVAILABLE",
+                retryable=True,
+            )
+        assert transport == "stdio"
+        return PersistedCodex()
+
+    monkeypatch.delenv("AGENT_LANE_CODEX_TRANSPORT", raising=False)
+    monkeypatch.setattr(cli, "CodexAppServer", open_codex)
+    alias_root = tmp_path / "aliases"
+    save_alias(
+        "codex",
+        "lane-1",
+        {
+            "codex_thread_id": "thread-1",
+            "cwd": str(tmp_path),
+            "last_status": "interrupted",
+        },
+        alias_root,
+    )
+
+    result = cmd_codex_recent(
+        SimpleNamespace(
+            alias_root=str(alias_root),
+            aliases_only=False,
+            include_unaliased=True,
+            include_subagents=False,
+            include_last_turn=True,
+            refresh=False,
+            limit=1,
+            observe="auto",
+            detail="summary",
+        )
+    )
+
+    item = result["items"][0]
+    assert item["last_turn"]["status"] == "interrupted"
+    assert item["last_turn"]["source"] == "persisted_app_server"
+    assert item["runner_status"] == "unknown"
+    assert item["execution_active"] is None
+    assert item["execution"] == {
+        **item["execution"],
+        "state": "unknown",
+        "active": None,
+        "effective_turn_status": "unknown",
+        "authoritative": False,
+        "stale": True,
+        "observation_mode": "persisted_stdio",
+    }
+    assert isinstance(item["execution"]["observed_at"], float)
+    assert item["execution"]["evidence"]["thread"]["authoritative"] is False
+    assert result["warnings"][0]["code"] == (
+        "CODEX_SESSION_STATE_NON_AUTHORITATIVE"
+    )
+
+
+def test_lane_scope_auto_fallback_preserves_warning_and_unknown_state(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    alias_root = tmp_path / "aliases"
+    save_alias(
+        "codex",
+        "lane-1",
+        {
+            "codex_thread_id": "thread-1",
+            "cwd": str(tmp_path),
+            "last_status": "interrupted",
+        },
+        alias_root,
+    )
+
+    class PersistedCodex:
+        transport = "stdio"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def read_thread(self, thread_id, include_turns=False):
+            assert thread_id == "thread-1"
+            assert include_turns is False
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "cwd": str(tmp_path),
+                    "status": {"type": "notLoaded"},
+                }
+            }
+
+    def open_codex(*, transport=None):
+        if transport is None:
+            raise CodexRpcError(
+                "daemon unavailable",
+                error_code="CODEX_DAEMON_UNAVAILABLE",
+                retryable=True,
+            )
+        assert transport == "stdio"
+        return PersistedCodex()
+
+    monkeypatch.delenv("AGENT_LANE_CODEX_TRANSPORT", raising=False)
+    monkeypatch.setattr(cli, "CodexAppServer", open_codex)
+
+    rc = main(
+        [
+            "codex",
+            "session",
+            "list",
+            "--scope",
+            "lanes",
+            "--alias-root",
+            str(alias_root),
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+    item = envelope["data"]["items"][0]
+
+    assert rc == 0
+    assert envelope["warnings"][0]["code"] == (
+        "CODEX_SESSION_STATE_NON_AUTHORITATIVE"
+    )
+    assert envelope["data"]["live_status_authoritative"] is False
+    assert item["execution"]["state"] == "unknown"
+    assert item["execution"]["status"] == "unknown"
+    assert item["execution"]["authoritative"] is False
+    assert item["execution"]["stale"] is True
+
+
+def test_lane_scope_stored_never_promotes_alias_terminal_status(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    alias_root = tmp_path / "aliases"
+    save_alias(
+        "codex",
+        "lane-1",
+        {
+            "codex_thread_id": "thread-1",
+            "custom_title": "Needle lane",
+            "cwd": str(tmp_path),
+            "last_status": "interrupted",
+        },
+        alias_root,
+    )
+    monkeypatch.setattr(
+        cli,
+        "CodexAppServer",
+        lambda *_args, **_kwargs: pytest.fail(
+            "stored lane scope must not open app-server"
+        ),
+    )
+
+    for command in (["list"], ["find", "Needle"]):
+        rc = main(
+            [
+                "codex",
+                "session",
+                *command,
+                "--scope",
+                "lanes",
+                "--observe",
+                "stored",
+                "--alias-root",
+                str(alias_root),
+            ]
+        )
+        envelope = json.loads(capsys.readouterr().out)
+        item = envelope["data"]["items"][0]
+
+        assert rc == 0
+        assert envelope["warnings"][0]["code"] == (
+            "CODEX_SESSION_STATE_NON_AUTHORITATIVE"
+        )
+        assert envelope["data"]["observation_mode"] == "stored_alias"
+        assert envelope["data"]["live_status_authoritative"] is False
+        assert item["execution"]["state"] == "unknown"
+        assert item["execution"]["status"] == "unknown"
+        assert item["execution"]["authoritative"] is False
+        assert item["execution"]["stale"] is True
+
+
+def test_session_list_default_compact_projection_is_small_and_actionable(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    class CompactCodex:
+        transport = "daemon"
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return None
+
+        def list_threads(self, **_kwargs):
+            return {
+                "data": [
+                    {
+                        "id": "thread-1",
+                        "name": None,
+                        "cwd": str(tmp_path),
+                        "status": {"type": "active"},
+                        "recencyAt": 10,
+                        "preview": "Compact task\n" + "x" * 2000,
+                    }
+                ]
+            }
+
+        def get_goal(self, _thread_id):
+            return None
+
+    monkeypatch.setattr(cli, "CodexAppServer", CompactCodex)
+
+    rc = main(
+        [
+            "codex",
+            "session",
+            "list",
+            "--observe",
+            "live",
+            "--limit",
+            "1",
+            "--alias-root",
+            str(tmp_path / "aliases"),
+        ]
+    )
+    raw = capsys.readouterr().out
+    result = decode_cli_output(raw)
+
+    assert rc == 0, result
+    assert result["detail"] == "compact"
+    assert "project_groups" not in result
+    assert result["items"] == [
+        {
+            "thread_id": "thread-1",
+            "title": "Compact task",
+            "cwd": str(tmp_path),
+            "updated_at": 10.0,
+            "execution": {
+                "state": "active",
+                "status": "inProgress",
+                "authoritative": True,
+                "stale": False,
+                "observed_at": result["items"][0]["execution"]["observed_at"],
+            },
+            "final_lead": None,
+            "requires_attach": True,
+        }
+    ]
+    assert isinstance(result["items"][0]["execution"]["observed_at"], float)
+    assert len(raw.encode()) < 4096
 
 
 def test_recent_auto_transport_falls_back_when_app_transport_is_unobserved(

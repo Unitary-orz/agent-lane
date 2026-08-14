@@ -91,7 +91,7 @@ def test_name_get_uses_codex_title_and_removes_legacy_title_fields(
     alias = load_alias("codex", "lane-1", tmp_path)
 
     assert rc == 0
-    assert FakeNameCodex.init_kwargs == [{"transport": "stdio"}]
+    assert FakeNameCodex.init_kwargs == [{}]
     assert result["lane_title"] == "App title"
     assert result["lane_title_source"] == "codex_title"
     assert result["custom_title"] is None

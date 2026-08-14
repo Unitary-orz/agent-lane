@@ -328,7 +328,9 @@ def _add_session_commands(codex_sub: argparse._SubParsersAction) -> None:
     )
     get = name_sub.add_parser("get")
     _add_thread_target(get)
-    get.add_argument("--observe", choices=("stored", "live"), default="stored")
+    get.add_argument(
+        "--observe", choices=("auto", "stored", "live"), default="auto"
+    )
     _set(get, "codex.session.name.get")
     set_command = name_sub.add_parser("set")
     _add_lane_target(set_command)
@@ -339,13 +341,15 @@ def _add_session_commands(codex_sub: argparse._SubParsersAction) -> None:
     outline = session_sub.add_parser("outline")
     _add_thread_target(outline)
     outline.add_argument(
-        "--observe", choices=("stored", "live"), default="stored"
+        "--observe", choices=("auto", "stored", "live"), default="auto"
     )
     _set(outline, "codex.session.outline")
 
     read = session_sub.add_parser("read")
     _add_thread_target(read)
-    read.add_argument("--observe", choices=("stored", "live"), default="stored")
+    read.add_argument(
+        "--observe", choices=("auto", "stored", "live"), default="auto"
+    )
     read_scope = read.add_mutually_exclusive_group()
     read_scope.add_argument("--include-turns", action="store_true")
     read_scope.add_argument("--turn-id")
@@ -358,8 +362,14 @@ def _add_session_query_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--scope", choices=("all", "lanes"), default="all")
     parser.add_argument("--threads", choices=("main", "all"), default="main")
-    parser.add_argument("--observe", choices=("stored", "live"), default="stored")
-    parser.add_argument("--detail", choices=("metadata", "summary"), default="summary")
+    parser.add_argument(
+        "--observe", choices=("auto", "stored", "live"), default="auto"
+    )
+    parser.add_argument(
+        "--detail",
+        choices=("compact", "metadata", "summary"),
+        default="compact",
+    )
 
 
 def _add_lane_target(

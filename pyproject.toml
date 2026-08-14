@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-lane"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 description = "JSON-first control layer for durable Codex tasks"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -6,6 +6,19 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] 🚧
 
+## [v1.0.0-rc.4] - 2026-08-14 🚀
+
+> Make Codex session discovery compact, live-first, and safer to attach.
+
+### 🔄 Changed
+
+- Made Codex session discovery default to automatic live observation and a
+  compact list projection; persisted fallback state is now explicitly stale
+  and cannot infer a current terminal execution state.
+- Added attach-time workspace preflight using the latest public
+  `commandExecution.cwd`, with machine-readable attach-or-run recovery before
+  any alias is written while retaining runtime drift protection.
+
 ## [v1.0.0-rc.3] - 2026-08-11 🚀
 
 > Separate stable lane identity, live Codex naming, and explicit local title

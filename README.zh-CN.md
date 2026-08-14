@@ -8,7 +8,7 @@ V1 首先支持 Codex coding agent。
 
 [English](README.md) · [架构说明](docs/architecture.md) · [变更记录](CHANGELOG.md)
 
-> 当前版本：`1.0.0-rc.3`。Python 打包工具可能显示等价版本 `1.0.0rc3`。
+> 当前版本：`1.0.0-rc.4`。Python 打包工具可能显示等价版本 `1.0.0rc4`。
 
 ## 看一段真实的使用过程
 
@@ -148,17 +148,19 @@ Codex 私有数据库，也不自动操作 App UI。
 
 | agent-lane 子命令 | Codex 接口 | 实现方式 |
 | --- | --- | --- |
-| `codex session list` | `thread/list` | 使用 stored 或 live 观察列出近期主 task，或包含全部 task thread。 |
+| `codex session list` | `thread/list` | 列出近期主 task 或全部 task thread；默认自动读取 live 状态并返回 compact 投影。 |
 | `codex session find` | `thread/list` 搜索和本地匹配 | 搜索标题、prompt、lane 元数据、工作目录信息和 task 摘要。 |
-| `codex session attach` | `thread/read` | 校验已有 task，再绑定到内部稳定 lane ID 和指定执行模式；调用方可不提供 lane ID。 |
+| `codex session attach` | `thread/read` | 校验已有 task 及其最近命令的工作区，再绑定到内部稳定 lane ID 和指定执行模式；调用方可不提供 lane ID。 |
 | `codex session name get` | `thread/read` | 读取 stored 或 live Codex task 名称。 |
 | `codex session name set` | `thread/name/set`，然后 `thread/read` | 可带冲突检查更新 task 名称，并精确读回确认。 |
 | `codex custom-title get/set/clear` | 本地 lane alias | 读取、设置或清除 `lane_title` 使用的显式本地覆盖；不会重命名 Codex task。 |
-| `codex session outline` | `thread/read` | 返回 task 身份、turn、prompt 和执行状态的紧凑投影。 |
+| `codex session outline` | `thread/read` | 返回 task 身份、prompt 和历史 turn 状态的紧凑投影。 |
 | `codex session read` | `thread/read` | 读取完整 task、全部 turn，或指定的一个 turn。 |
 
-`session list` 和 `session read` 会返回机器可读的 `control` 对象。尚未绑定的
-task 仍然只能读取，并报告 `requires_explicit_attach: true` 与建议的
+`session list --detail metadata`、`session list --detail summary` 和
+`session read` 会返回机器可读的 `control` 对象；默认 compact 列表只保留其中的
+`requires_attach`。尚未绑定的 task 仍然只能读取，并报告
+`requires_explicit_attach: true` 与建议的
 `attach_argv`。stored 观察建议 `independent`，live 观察建议 `app-sync`。只有显式
 attach 后才取得控制权：
 
@@ -171,6 +173,13 @@ agent-lane codex send \
   --prompt "继续处理已经核实的 task。"
 ```
 
+只读 session 查询默认使用 `--observe auto`；`session list` 和
+`session find` 还默认使用 `--detail compact`。auto 会优先读取 App Sync 的 live
+状态；若 live 不可用，仍返回持久化历史证据，但当前执行状态固定为
+`state: unknown`、`stale: true` 并附明确 warning，不会把持久化 turn 状态提升为
+权威终态。`outline` 中的 turn 状态也只能按该 warning 解释为历史记录。列表需要更大
+的诊断投影时使用 `--detail metadata` 或 `--detail summary`。
+
 attach 缺省使用 `independent`；确实需要 App 共用控制时再显式传
 `--mode app-sync`。首次 attach 未传 lane ID 时会生成内部稳定 ID；同一 thread
 重复 attach 会复用它；显式重复 attach 也可切换该 lane 的执行模式，而不会创建
@@ -178,6 +187,12 @@ attach 缺省使用 `independent`；确实需要 App 共用控制时再显式传
 `checkpoint`、`closeout` 和 `goal get` 可直接检查未绑定的精确 thread；控制命令
 则以 `CODEX_TARGET_ATTACH_REQUIRED` 返回分离的 `attach_argv` 与
 `after_attach_argv`，后者保留完整的原控制请求；只读投影不会虚构后续 prompt。
+写入绑定前，如果公共历史提供了最近的 `commandExecution.cwd`，attach 会把它与
+请求或 task cwd 比较。若属于不同工作区，会以
+`CODEX_ATTACH_WORKSPACE_DRIFT` 失败：首次绑定或 App-adopted binding 返回精确的
+attach 重试；已有受管 lane 则要求走现有 `run` task-replacement 路径。若没有可用的
+command cwd，`workspace_preflight.status` 为 `unavailable`；仅当请求或 task cwd
+不会移动已有受管 lane 时才允许继续 attach。运行时工作区漂移检查仍作为最终保护。
 
 ### Goal 与运行参数
 
@@ -207,7 +222,7 @@ App Sync 直接提供以下 Codex App 集成功能：
 | `config app-sync status` | 报告持久化 App Sync 就绪状态。 | 检查托管运行时、socket、兼容 Codex CLI 和登录配置。 |
 | `doctor --mode app-sync --probe` | 验证端到端共用控制。 | 打开本地 WebSocket，并完成 JSON-RPC `initialize` 探测。 |
 | `codex run --mode app-sync` | 创建或恢复 Agent 与 Codex App 都能访问的 task。 | 使用共用运行时 transport，并将 `app-sync` 持久化为 lane 的执行模式。 |
-| `codex session list --observe live`、`codex session find --observe live` | 列出或搜索 App 当前可见的 task。 | 通过共用控制面查询 `thread/list`，不使用独立 stdio transport。 |
+| `codex session list`、`codex session find` | App Sync 可用时列出或搜索 App 当前可见的 task。 | 默认使用 `--observe auto`，优先查询共用控制面；持久化 fallback 会标记为非权威。 |
 | `codex session name get --observe live`、`codex session outline --observe live`、`codex session read --observe live` | 读取 App 当前可见的 task 元数据、消息和 turn 状态。 | 通过共用控制面查询 `thread/read`。 |
 | `codex session attach --mode app-sync` | 将 App 创建的 Codex task 纳入 lane 管理。 | 校验 task，获取 task/lane 锁，再保存 lane 绑定。 |
 | `codex steer` | 向当前共用 turn 补充输入。 | 仅在识别到唯一且明确的 active turn 后发送 `turn/steer`。 |

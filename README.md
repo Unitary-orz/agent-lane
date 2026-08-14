@@ -10,8 +10,8 @@ V1 supports Codex as its first coding agent.
 [Architecture](https://github.com/Unitary-orz/agent-lane/blob/main/docs/architecture.md) ·
 [Changelog](https://github.com/Unitary-orz/agent-lane/blob/main/CHANGELOG.md)
 
-> Current version: `1.0.0-rc.3`. Python packaging tools may display the
-> equivalent version `1.0.0rc3`.
+> Current version: `1.0.0-rc.4`. Python packaging tools may display the
+> equivalent version `1.0.0rc4`.
 
 ## See what it does in a real conversation
 
@@ -160,16 +160,18 @@ databases or App UI automation.
 
 | agent-lane command | Codex surface | Implementation |
 | --- | --- | --- |
-| `codex session list` | `thread/list` | Lists recent main tasks or all task threads using stored or live observation. |
+| `codex session list` | `thread/list` | Lists recent main tasks or all task threads; defaults to automatic live observation and a compact projection. |
 | `codex session find` | `thread/list` with search and local matching | Searches titles, prompts, lane metadata, workspace information, and task summaries. |
-| `codex session attach` | `thread/read` | Validates an existing task, then binds it to an internal stable lane ID and execution mode; a caller-supplied lane ID is optional. |
+| `codex session attach` | `thread/read` | Validates an existing task and its latest command workspace before binding it to an internal stable lane ID and execution mode; a caller-supplied lane ID is optional. |
 | `codex session name get` | `thread/read` | Reads the stored or live Codex task name. |
 | `codex session name set` | `thread/name/set`, then `thread/read` | Updates the Codex task name with optional conflict checking and exact read-back. |
 | `codex custom-title get/set/clear` | local lane alias | Reads, sets, or clears the explicit local override used by `lane_title`; it never renames the Codex task. |
-| `codex session outline` | `thread/read` | Returns a compact projection of task identity, turns, prompts, and execution state. |
+| `codex session outline` | `thread/read` | Returns a compact projection of task identity, prompts, and historical turn status. |
 | `codex session read` | `thread/read` | Reads the full task, all turns, or one selected turn. |
 
-`session list` and `session read` include a machine-readable `control` object.
+`session list --detail metadata`, `session list --detail summary`, and
+`session read` include a machine-readable `control` object; the default compact
+list exposes only `requires_attach` from that contract.
 An unbound task remains read-only and reports `requires_explicit_attach: true`
 plus an `attach_argv` suggestion. Stored observation suggests `independent`;
 live observation suggests `app-sync`. Control begins only after an explicit
@@ -184,11 +186,29 @@ agent-lane codex send \
   --prompt "Continue the verified task."
 ```
 
+Read-only session queries default to `--observe auto`; `session list` and
+`session find` also default to `--detail compact`. Auto observation uses live
+App Sync state when available. If live observation is unavailable, persisted
+data remains visible as historical evidence, but current execution is reported
+as `state: unknown`, `stale: true`, with an explicit warning; persisted turn
+status is never promoted to an authoritative terminal state. `outline` likewise
+retains turn statuses only as history under that warning. Use
+`--detail metadata` or `--detail summary` for the larger list projections.
+
 Attach defaults to `independent`; pass `--mode app-sync` explicitly when shared
 App control is required. The first attach generates an internal stable lane ID
 when none is supplied, and a repeated attach of the same thread reuses it. An
 explicit repeated attach may change that lane's execution mode without creating
 a second binding.
+Before writing the binding, attach compares the requested or task cwd with the
+latest public `commandExecution.cwd` when that observation is available. A
+different workspace fails with `CODEX_ATTACH_WORKSPACE_DRIFT`; a first or
+App-adopted binding receives an exact attach retry, while an existing managed
+lane is directed through the established `run` task-replacement path. If no
+command cwd is available, `workspace_preflight.status` is `unavailable` and
+attach may proceed only when the requested or task cwd does not move an
+existing managed lane. The runtime workspace-drift check remains the final
+guard.
 Neither discovery nor reading creates a lane binding. Read-only `status`,
 `wait`, `checkpoint`, `closeout`, and `goal get` can inspect an exact unbound
 thread without attaching; a control command instead returns
@@ -225,7 +245,7 @@ App Sync exposes the following Codex App integration directly:
 | `config app-sync status` | Reports persistent App Sync readiness. | Checks the managed runtime, socket, compatible Codex CLI, and login configuration. |
 | `doctor --mode app-sync --probe` | Verifies end-to-end shared control. | Opens the local WebSocket and completes a JSON-RPC `initialize` probe. |
 | `codex run --mode app-sync` | Creates or resumes a task visible to both agent-lane and Codex App. | Uses the shared runtime transport and persists `app-sync` as the lane's execution mode. |
-| `codex session list --observe live`, `codex session find --observe live` | Lists or searches current App-visible tasks. | Queries `thread/list` through the shared control plane instead of the independent stdio transport. |
+| `codex session list`, `codex session find` | Lists or searches current App-visible tasks when App Sync is available. | Defaults to `--observe auto`; it queries the shared control plane first and marks a persisted fallback non-authoritative. |
 | `codex session name get --observe live`, `codex session outline --observe live`, `codex session read --observe live` | Reads current App-visible task metadata, messages, and turn state. | Queries `thread/read` through the shared control plane. |
 | `codex session attach --mode app-sync` | Brings an App-created Codex task under lane management. | Validates the task, acquires task/lane locks, and stores the lane binding. |
 | `codex steer` | Adds input to the active shared turn. | Sends `turn/steer` only after identifying one unambiguous active turn. |

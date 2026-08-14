@@ -33,12 +33,17 @@ Commands under `agent-lane codex` create, resume, observe, and close out work:
 
 `codex session` exposes task discovery separately from execution:
 
-- `list` and `find` enumerate stored or live task projections.
+- `list` and `find` default to compact task projections and automatic live
+  observation.
 - `attach` binds an existing Codex task to a lane.
 - `name`, `outline`, and `read` inspect task identity and content.
 
-Stored observation is the default. Live observation is explicit and must not
-silently fall back to stale state when the caller asked for live data.
+Automatic observation is the default. It uses live App Sync state when
+available; a persisted fallback is explicitly stale and cannot establish a
+current terminal state. Explicit live observation still fails instead of
+silently falling back. The larger metadata and summary projections remain
+opt-in. Compact list items contain only `thread_id`, `title`, `cwd`,
+`updated_at`, `execution`, `final_lead`, and `requires_attach`.
 
 ### Self-configuration layer
 
@@ -96,6 +101,15 @@ generates a deterministic internal ID. A new attach defaults to `independent`;
 choosing App Sync remains explicit. Read-only execution and Goal inspection may
 target an exact unbound thread directly, but control operations fail before
 app-server access until attached.
+
+Attach reads the latest public command cwd before creating or updating the
+binding when one is available. A sibling-worktree or otherwise distinct
+workspace fails before the alias write. A first or App-adopted binding can
+retry attach with a matching explicit `--cwd`; an existing managed lane must
+use the established `run` replacement path. Missing command-cwd evidence is
+reported as an unavailable preflight and does not block attach unless the
+requested or task cwd would move an existing managed lane. Runtime
+workspace-drift detection remains the final safety boundary.
 
 Alias-registry scans used for control or contextual selection fail closed when
 an entry is unreadable because uniqueness cannot then be proven. Exact
