@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] 🚧
 
+## [v1.0.0] - 2026-08-21 🚀
+
+> 完整功能
+
 ### 🔄 Changed
 
 - Made the Chinese README the default repository and package landing page, with

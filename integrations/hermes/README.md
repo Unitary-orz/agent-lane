@@ -36,5 +36,5 @@ Contents:
 - `skills/agent-lane-codex/references/subagent-usage.md` — expanded example
 - `short-prompt-card.md` — compact delegation prompt
 
-The integration tracks the release-candidate CLI and intentionally omits
+The integration tracks the stable V1 CLI and intentionally omits
 pre-1.0 commands such as `recent`, `adopt`, `--brief`, and App page navigation.

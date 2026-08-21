@@ -1,7 +1,7 @@
 ---
 name: agent-lane-codex
 description: "Use agent-lane to start, inspect, continue, steer, and close out durable Codex coding tasks, including optional App Sync."
-version: 1.0.0-rc.4
+version: 1.0.0
 author: Unitary-orz
 license: MIT
 platforms: [macos]

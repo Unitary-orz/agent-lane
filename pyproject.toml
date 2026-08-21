@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-lane"
-version = "1.0.0-rc.4"
+version = "1.0.0"
 description = "JSON-first control layer for durable Codex tasks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = "MIT"
 authors = [{ name = "Unitary-orz" }]
 dependencies = []
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Operating System :: MacOS",

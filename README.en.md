@@ -10,8 +10,7 @@ V1 supports Codex as its first coding agent.
 [Architecture](https://github.com/Unitary-orz/agent-lane/blob/main/docs/architecture.md) ·
 [Changelog](https://github.com/Unitary-orz/agent-lane/blob/main/CHANGELOG.md)
 
-> Current version: `1.0.0-rc.4`. Python packaging tools may display the
-> equivalent version `1.0.0rc4`.
+> Current version: `1.0.0`.
 
 ## See what it does in a real conversation
 

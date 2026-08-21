@@ -257,7 +257,7 @@ src/agent_lane/
 ## Compatibility policy
 
 V1 is a hard break from pre-1.0 syntax. Removed UI navigation and legacy options
-return explicit migration errors instead of being ignored. The release
-candidate may still change before `1.0.0`, but changes to the JSON envelope,
-lane identity, or execution-mode semantics require corresponding contract tests
-and changelog entries.
+return explicit migration errors instead of being ignored. The V1 contract is
+stable: changes to the JSON envelope, lane identity, or execution-mode semantics
+require corresponding contract tests and changelog entries; breaking changes
+require a new major version.

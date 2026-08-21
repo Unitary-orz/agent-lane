@@ -10,7 +10,7 @@ V1 首先支持 Codex coding agent。
 [架构说明](https://github.com/Unitary-orz/agent-lane/blob/main/docs/architecture.md) ·
 [变更记录](https://github.com/Unitary-orz/agent-lane/blob/main/CHANGELOG.md)
 
-> 当前版本：`1.0.0-rc.4`。Python 打包工具可能显示等价版本 `1.0.0rc4`。
+> 当前版本：`1.0.0`。
 
 ## 看一段真实的使用过程
 
