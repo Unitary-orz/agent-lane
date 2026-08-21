@@ -6,6 +6,17 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] 🚧
 
+### 🔄 Changed
+
+- Made the Chinese README the default repository and package landing page, with
+  the English edition retained as `README.en.md`.
+
+### 🐞 Fixed
+
+- Made attach workspace preflight fall back to public `thread.cwd` when recent
+  command cwd evidence is unavailable, so an explicit mismatched cwd fails
+  before creating a lane binding or starting a turn.
+
 ## [v1.0.0-rc.4] - 2026-08-14 🚀
 
 > Make Codex session discovery compact, live-first, and safer to attach.

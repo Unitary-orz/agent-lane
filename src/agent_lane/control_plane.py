@@ -2645,11 +2645,25 @@ def _attach_workspace_preflight(
     existing: dict[str, Any] | None,
 ) -> tuple[str | None, dict[str, Any], str]:
     explicit_cwd = _nonempty_text(requested_cwd)
-    thread_cwd = _nonempty_text(thread.get("cwd"))
+    raw_thread_cwd = _nonempty_text(thread.get("cwd"))
+    thread_cwd = (
+        str(Path(raw_thread_cwd).expanduser().resolve(strict=False))
+        if raw_thread_cwd is not None
+        else None
+    )
     observed_cwd = _latest_command_cwd(thread)
     configured_cwd = _resolve_cwd(explicit_cwd or thread_cwd, None)
     if configured_cwd is None and observed_cwd is not None:
         configured_cwd = _resolve_cwd(observed_cwd, None)
+
+    evidence_cwd = observed_cwd or thread_cwd
+    evidence_source = (
+        "recent_command"
+        if observed_cwd is not None
+        else "thread"
+        if thread_cwd is not None
+        else "unavailable"
+    )
 
     source = (
         "explicit_attach"
@@ -2659,18 +2673,18 @@ def _attach_workspace_preflight(
         else "thread"
     )
     preflight = {
-        "status": "unavailable" if observed_cwd is None else "matched",
+        "status": "unavailable" if evidence_cwd is None else "matched",
         "configured_cwd": configured_cwd,
         "thread_cwd": thread_cwd,
         "observed_cwd": observed_cwd,
         "observed_worktree": None,
-        "source": "recent_command" if observed_cwd is not None else "unavailable",
+        "source": evidence_source,
     }
     existing_cwd = _nonempty_text((existing or {}).get("cwd"))
     managed_lane = bool(
         existing is not None and existing.get("adopted_from") != "codex-app"
     )
-    replacement_cwd = observed_cwd or configured_cwd
+    replacement_cwd = evidence_cwd or configured_cwd
     managed_drift = (
         sibling_worktree_drift(existing_cwd, replacement_cwd)
         if existing_cwd is not None and replacement_cwd is not None
@@ -2692,6 +2706,7 @@ def _attach_workspace_preflight(
             configured_cwd=existing_cwd,
             thread_cwd=thread_cwd,
             observed_cwd=observed_cwd,
+            workspace_evidence_source=evidence_source,
             observed_worktree=(
                 managed_drift.get("observed_worktree")
                 if isinstance(managed_drift, dict)
@@ -2714,39 +2729,40 @@ def _attach_workspace_preflight(
             },
             retryable=False,
         )
-    if configured_cwd is None or observed_cwd is None:
+    if configured_cwd is None or evidence_cwd is None:
         return configured_cwd, preflight, source
 
-    drift = sibling_worktree_drift(configured_cwd, observed_cwd)
-    binding_changed = workspace_binding_changed(configured_cwd, observed_cwd)
+    drift = sibling_worktree_drift(configured_cwd, evidence_cwd)
+    binding_changed = workspace_binding_changed(configured_cwd, evidence_cwd)
     if drift is None and not binding_changed:
         return configured_cwd, preflight, source
 
     observed_worktree = (
-        drift.get("observed_worktree") if isinstance(drift, dict) else observed_cwd
+        drift.get("observed_worktree") if isinstance(drift, dict) else evidence_cwd
     )
     raise WorkspaceError(
         "CODEX_ATTACH_WORKSPACE_DRIFT",
-        "the task's latest command ran in a different workspace; retry attach "
-        "with the observed cwd",
+        "the task's latest known workspace differs from the requested cwd; "
+        "retry attach with the reported cwd",
         control_created=False,
         lane_id=lane_id,
         codex_thread_id=thread_id,
         configured_cwd=configured_cwd,
         thread_cwd=thread_cwd,
         observed_cwd=observed_cwd,
+        workspace_evidence_source=evidence_source,
         observed_worktree=observed_worktree,
         git_common_dir=(
             drift.get("git_common_dir") if isinstance(drift, dict) else None
         ),
-        recommended_cwd=observed_cwd,
+        recommended_cwd=evidence_cwd,
         replacement_required=False,
         recommended_attach_argv=_recommended_attach_argv(
             thread_id=thread_id,
             lane_id=lane_id,
             alias_root=alias_root,
             execution_mode=execution_mode,
-            cwd=observed_cwd,
+            cwd=evidence_cwd,
         ),
         retryable=False,
     )

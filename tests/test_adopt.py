@@ -78,9 +78,7 @@ class FakeAdoptCodex:
 
 def test_adopt_binds_existing_app_thread_to_lane(tmp_path, monkeypatch, capsys):
     workspace = tmp_path / "workspace"
-    fallback = tmp_path / "fallback"
     workspace.mkdir()
-    fallback.mkdir()
     FakeAdoptCodex.cwd = workspace
     monkeypatch.setattr(cli, "CodexAppServer", FakeAdoptCodex)
 
@@ -92,7 +90,7 @@ def test_adopt_binds_existing_app_thread_to_lane(tmp_path, monkeypatch, capsys):
             "--thread-id",
             "thread-app",
             "--cwd",
-            str(fallback),
+            str(workspace),
             "--title",
             "Custom lane title",
             "--alias-root",
@@ -109,7 +107,7 @@ def test_adopt_binds_existing_app_thread_to_lane(tmp_path, monkeypatch, capsys):
     assert alias["execution_mode"] == "independent"
     assert alias["execution_mode_source"] == "explicit"
     assert alias["adopted_from"] == "codex-app"
-    assert alias["cwd"] == str(fallback)
+    assert alias["cwd"] == str(workspace)
     assert alias["workspace_binding_source"] == "explicit_attach"
     assert alias["custom_title"] == "Custom lane title"
     assert "title" not in alias
@@ -117,7 +115,14 @@ def test_adopt_binds_existing_app_thread_to_lane(tmp_path, monkeypatch, capsys):
     assert alias["codex_title"] == "App task"
     assert result["lane_title"] == "Custom lane title"
     assert result["lane_title_source"] == "custom_title"
-    assert result["workspace_preflight"]["status"] == "unavailable"
+    assert result["workspace_preflight"] == {
+        "status": "matched",
+        "configured_cwd": str(workspace),
+        "thread_cwd": str(workspace),
+        "observed_cwd": None,
+        "observed_worktree": None,
+        "source": "thread",
+    }
     assert result["control"] == {
         "binding_status": "attached",
         "control_ready": True,
@@ -147,6 +152,49 @@ def test_adopt_binds_existing_app_thread_to_lane(tmp_path, monkeypatch, capsys):
             str(tmp_path / "aliases"),
         ],
     }
+
+
+def test_attach_rejects_explicit_cwd_different_from_thread_without_command_cwd(
+    tmp_path, monkeypatch, capsys
+):
+    thread_workspace = tmp_path / "thread-workspace"
+    requested_workspace = tmp_path / "requested-workspace"
+    thread_workspace.mkdir()
+    requested_workspace.mkdir()
+    aliases = tmp_path / "aliases"
+    FakeAdoptCodex.cwd = thread_workspace
+    FakeAdoptCodex.turns = []
+    monkeypatch.setattr(cli, "CodexAppServer", FakeAdoptCodex)
+
+    rc = main(
+        [
+            "codex",
+            "session",
+            "attach",
+            "--mode",
+            "independent",
+            "--thread-id",
+            "thread-app",
+            "--cwd",
+            str(requested_workspace),
+            "--alias-root",
+            str(aliases),
+        ]
+    )
+    result = decode_cli_output(capsys.readouterr().out)
+
+    assert rc == 1
+    assert result["error_code"] == "CODEX_ATTACH_WORKSPACE_DRIFT"
+    assert result["configured_cwd"] == str(requested_workspace)
+    assert result["thread_cwd"] == str(thread_workspace)
+    assert result["observed_cwd"] is None
+    assert result["workspace_evidence_source"] == "thread"
+    assert result["recommended_cwd"] == str(thread_workspace)
+    assert result["recommended_attach_argv"][-2:] == [
+        "--cwd",
+        str(thread_workspace),
+    ]
+    assert load_alias("codex", result["lane_id"], aliases) is None
 
 
 def test_attach_defaults_to_independent_without_implicit_send(

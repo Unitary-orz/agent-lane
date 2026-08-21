@@ -37,7 +37,7 @@ claim that a particular Codex App build is compatible.
 ## Changes and documentation
 
 - Add focused tests for new behavior and failure paths.
-- Update both `README.md` and `README.zh-CN.md` when the public workflow changes.
+- Update both `README.md` and `README.en.md` when the public workflow changes.
 - Add user-visible changes to `CHANGELOG.md`.
 - Follow [the release process](docs/release-process.md) for version headings,
   local Release Notes preview, tagging, and automatic publication.

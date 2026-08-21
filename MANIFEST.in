@@ -2,7 +2,7 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 include LICENSE
 include README.md
-include README.zh-CN.md
+include README.en.md
 include SECURITY.md
 include scripts/release_notes.py
 include tests/conftest.py

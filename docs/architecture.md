@@ -103,13 +103,13 @@ target an exact unbound thread directly, but control operations fail before
 app-server access until attached.
 
 Attach reads the latest public command cwd before creating or updating the
-binding when one is available. A sibling-worktree or otherwise distinct
-workspace fails before the alias write. A first or App-adopted binding can
-retry attach with a matching explicit `--cwd`; an existing managed lane must
-use the established `run` replacement path. Missing command-cwd evidence is
-reported as an unavailable preflight and does not block attach unless the
-requested or task cwd would move an existing managed lane. Runtime
-workspace-drift detection remains the final safety boundary.
+binding, falling back to the public thread cwd when command-cwd evidence is not
+available. A sibling-worktree or otherwise distinct workspace fails before the
+alias write. A first or App-adopted binding can retry attach with a matching
+explicit `--cwd`; an existing managed lane must use the established `run`
+replacement path. The preflight is unavailable only when neither source
+exposes a cwd. Runtime workspace-drift detection remains the final safety
+boundary.
 
 Alias-registry scans used for control or contextual selection fail closed when
 an entry is unreadable because uniqueness cannot then be proven. Exact

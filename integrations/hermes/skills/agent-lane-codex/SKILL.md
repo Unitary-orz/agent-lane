@@ -243,12 +243,12 @@ of that thread reuses it. Follow-up execution is a separate `send` against the
 exact thread target.
 
 Attach checks the task's latest observed command workspace before writing the
-binding when public command-cwd evidence is available. On
-`CODEX_ATTACH_WORKSPACE_DRIFT`, do not send a turn: use
+binding, falling back to the public thread cwd when command-cwd evidence is not
+available. On `CODEX_ATTACH_WORKSPACE_DRIFT`, do not send a turn: use
 `recommended_attach_argv` for a first or App-adopted binding, or the returned
 `run` replacement recovery for an existing managed lane. A preflight status of
-`unavailable` may proceed only when it does not move an existing managed lane,
-so retain the runtime drift guard as the final authority.
+`unavailable` means neither source exposed a cwd, so retain the runtime drift
+guard as the final authority.
 
 Use `session name get/set` to read or change the task name. Do not infer that a
 name observed in one store has been written to another; live read-back is an
